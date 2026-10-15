@@ -1,0 +1,12 @@
+{
+  "name": "queup-dead-song-finder",
+  "version": "0.1.17",
+  "description": "A userscript for QueUp that finds songs in your own playlists that can't be played anymore, and finds clear replacements",
+  "scripts": {
+    "build": "node tools/build-userscript.js",
+    "test": "node --test --test-reporter=spec tests/*-test.js"
+  },
+  "engines": { "node": ">=20" },
+  "repository": { "type": "git", "url": "git+https://github.com/supaflysnooka/queup-dead-song-finder.git" },
+  "license": "MIT"
+}

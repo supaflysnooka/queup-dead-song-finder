@@ -1,0 +1,17 @@
+// ==UserScript==
+// @name         QueUp Dead Song Finder
+// @namespace    https://github.com/supaflysnooka/queup-dead-song-finder
+// @version      0.1.17
+// @description  Finds songs in your own QueUp playlists that can't be played anymore, and finds clear replacements. Nothing changes until you click Apply.
+// @author       supaflysnooka
+// @homepageURL  https://github.com/supaflysnooka/queup-dead-song-finder
+// @supportURL   https://github.com/supaflysnooka/queup-dead-song-finder/issues
+// @match        https://queup.net/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      www.youtube.com
+// @noframes
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
