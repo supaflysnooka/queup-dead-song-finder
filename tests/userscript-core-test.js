@@ -197,6 +197,41 @@ describe('listPlaylists and readPlaylist', function() {
   });
 });
 
+describe('looking elsewhere for a song that could not be found', function() {
+  it('needs an artist and a title, a dash with something on each side', function() {
+    assert.deepEqual(core.artistAndTitle('MEDL4 - Leaper'), { artist: 'MEDL4', title: 'Leaper', query: 'MEDL4 Leaper' });
+    assert.equal(core.artistAndTitle('Artist \u2013 Some - Thing').title, 'Some - Thing');
+    ['Roygbiv', 'Lapis', 'Artist-Title', ' - Title', 'Artist - ', '!! - ??', '', null, undefined].forEach(function(name) {
+      assert.equal(core.artistAndTitle(name), null, String(name));
+    });
+  });
+
+  it('gives searches by name only when the name is good, and one by picture only when there is a picture', function() {
+    var both = core.lookElsewhere({ type: 'youtube', fkid: 'abcdefghijk', name: 'MEDL4 - Leaper' });
+    assert.deepEqual(both.names.map(function(l) { return l.label; }), ['Search the web', 'YouTube', 'SoundCloud']);
+    assert.equal(both.names[0].url, 'https://www.google.com/search?q=MEDL4%20Leaper');
+    assert.equal(both.names[2].url, 'https://soundcloud.com/search?q=MEDL4%20Leaper');
+    assert.equal(both.imageSearch, 'https://lens.google.com/uploadbyurl?url=' + encodeURIComponent('https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg'));
+
+    var pictureOnly = core.lookElsewhere({ type: 'youtube', fkid: 'abcdefghijk', name: 'Lapis' });
+    assert.deepEqual(pictureOnly.names, []);
+    assert.ok(pictureOnly.imageSearch);
+
+    var nameOnly = core.lookElsewhere({ type: 'soundcloud', fkid: '12345', name: 'Artist - Title' });
+    assert.equal(nameOnly.imageSearch, null);
+    assert.equal(nameOnly.names.length, 3);
+
+    var neither = core.lookElsewhere({ type: 'soundcloud', fkid: '12345', name: 'Failed to refresh song details.' });
+    assert.deepEqual(neither, { imageSearch: null, names: [] });
+  });
+
+  it('only uses a picture from a site pictures come from, and puts a name in a link safely', function() {
+    assert.equal(core.lookElsewhere({ type: 'soundcloud', fkid: '1', name: 'Nothing', thumbnail: 'https://evil.example/x.jpg' }).imageSearch, null);
+    var tricky = core.lookElsewhere({ type: 'soundcloud', fkid: '1', name: 'A&B - "C" #1 ?x=1' });
+    assert.equal(tricky.names[0].url, 'https://www.google.com/search?q=' + encodeURIComponent('A&B "C" #1 ?x=1'));
+  });
+});
+
 describe('looking on the other site', function() {
   const playlist = { id: 'pl1', name: 'Spooky' };
   const dead = { type: 'youtube', fkid: YT(3), name: 'MEDL4 - Leaper', length: 200000 };

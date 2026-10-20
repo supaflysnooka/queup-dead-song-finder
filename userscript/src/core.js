@@ -124,6 +124,42 @@ function songLink(song) {
   return null;
 }
 
+/**
+ * "Artist - Title" as an artist and a title, when the name really has both (a dash with something on each side).
+ * A single word, or a title with no artist, is too little to search the web for.
+ */
+function artistAndTitle(name) {
+  var parts = String(name || '').split(/\s+[-\u2013\u2014]\s+/);
+  if (parts.length < 2) { return null; }
+
+  var artist = parts[0].trim();
+  var title = parts.slice(1).join(' - ').trim();
+  var hasText = function(text) { return /[\p{L}\p{N}]/u.test(text); };
+  return hasText(artist) && hasText(title) ? { artist: artist, title: title, query: (artist + ' ' + title).slice(0, 150) } : null;
+}
+
+/**
+ * Where the person could look themselves for a song that could not be found: searches for the name on the web, YouTube and
+ * SoundCloud (only when the name has an artist and a title), and a search by the picture (only when the song has one,
+ * which the screen checks has really loaded: a deleted video has lost it). Only links, nothing is sent anywhere
+ * until the person clicks one.
+ * @returns {{imageSearch: string|null, names: {label: string, url: string}[]}}
+ */
+function lookElsewhere(song) {
+  var named = hasRealName(song) ? artistAndTitle(song.name) : null;
+  var query = named ? encodeURIComponent(named.query) : null;
+  var image = pictureFor(song);
+
+  return {
+    imageSearch: image ? 'https://lens.google.com/uploadbyurl?url=' + encodeURIComponent(image) : null,
+    names: query ? [
+      { label: 'Search the web', url: 'https://www.google.com/search?q=' + query },
+      { label: 'YouTube', url: 'https://www.youtube.com/results?search_query=' + query },
+      { label: 'SoundCloud', url: 'https://soundcloud.com/search?q=' + query }
+    ] : []
+  };
+}
+
 var PLATFORM_NAMES = { youtube: 'YouTube', soundcloud: 'SoundCloud' };
 
 /** a link that is safe to load as a picture: https, from the sites song pictures come from */
@@ -966,6 +1002,8 @@ module.exports = {
   hasRealName: hasRealName,
   youtubeLink: youtubeLink,
   songLink: songLink,
+  artistAndTitle: artistAndTitle,
+  lookElsewhere: lookElsewhere,
   PLATFORM_NAMES: PLATFORM_NAMES,
   safeImageUrl: safeImageUrl,
   pictureFor: pictureFor,

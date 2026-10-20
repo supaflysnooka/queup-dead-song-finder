@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QueUp Dead Song Finder
 // @namespace    https://github.com/supaflysnooka/queup-dead-song-finder
-// @version      0.1.17
+// @version      0.1.18
 // @description  Finds songs in your own QueUp playlists that can't be played anymore, and finds clear replacements. Nothing changes until you click Apply.
 // @author       supaflysnooka
 // @homepageURL  https://github.com/supaflysnooka/queup-dead-song-finder
@@ -575,6 +575,42 @@ function songLink(song) {
   if (type === 'youtube') { return youtubeLink(song.fkid); }
   if (type === 'soundcloud' && /^\d+$/.test(String(song.fkid))) { return 'https://w.soundcloud.com/player/?url=' + encodeURIComponent('https://api.soundcloud.com/tracks/' + song.fkid); }
   return null;
+}
+
+/**
+ * "Artist - Title" as an artist and a title, when the name really has both (a dash with something on each side).
+ * A single word, or a title with no artist, is too little to search the web for.
+ */
+function artistAndTitle(name) {
+  var parts = String(name || '').split(/\s+[-\u2013\u2014]\s+/);
+  if (parts.length < 2) { return null; }
+
+  var artist = parts[0].trim();
+  var title = parts.slice(1).join(' - ').trim();
+  var hasText = function(text) { return /[\p{L}\p{N}]/u.test(text); };
+  return hasText(artist) && hasText(title) ? { artist: artist, title: title, query: (artist + ' ' + title).slice(0, 150) } : null;
+}
+
+/**
+ * Where the person could look themselves for a song that could not be found: searches for the name on the web, YouTube and
+ * SoundCloud (only when the name has an artist and a title), and a search by the picture (only when the song has one,
+ * which the screen checks has really loaded: a deleted video has lost it). Only links, nothing is sent anywhere
+ * until the person clicks one.
+ * @returns {{imageSearch: string|null, names: {label: string, url: string}[]}}
+ */
+function lookElsewhere(song) {
+  var named = hasRealName(song) ? artistAndTitle(song.name) : null;
+  var query = named ? encodeURIComponent(named.query) : null;
+  var image = pictureFor(song);
+
+  return {
+    imageSearch: image ? 'https://lens.google.com/uploadbyurl?url=' + encodeURIComponent(image) : null,
+    names: query ? [
+      { label: 'Search the web', url: 'https://www.google.com/search?q=' + query },
+      { label: 'YouTube', url: 'https://www.youtube.com/results?search_query=' + query },
+      { label: 'SoundCloud', url: 'https://soundcloud.com/search?q=' + query }
+    ] : []
+  };
 }
 
 var PLATFORM_NAMES = { youtube: 'YouTube', soundcloud: 'SoundCloud' };
@@ -1419,6 +1455,8 @@ module.exports = {
   hasRealName: hasRealName,
   youtubeLink: youtubeLink,
   songLink: songLink,
+  artistAndTitle: artistAndTitle,
+  lookElsewhere: lookElsewhere,
   PLATFORM_NAMES: PLATFORM_NAMES,
   safeImageUrl: safeImageUrl,
   pictureFor: pictureFor,
@@ -1450,7 +1488,7 @@ var require = __require;
  */
 
 var API = 'https://api.queup.net/';
-var VERSION = '0.1.17';
+var VERSION = '0.1.18';
 
 var CSS = [
   ':host { all: initial; }',
@@ -1478,6 +1516,7 @@ var CSS = [
   '.pics { display: flex; gap: 4px; flex-shrink: 0; }',
   '.pic { width: 72px; height: 54px; border-radius: 4px; background: #12141a; object-fit: cover; display: block; }',
   '.pic.gone { display: flex; align-items: center; justify-content: center; font-size: 10px; color: #7d8391; border: 1px dashed #3a3d46; text-align: center; }',
+  '.elsewhere a { margin-right: 10px; color: #8ab4f8; }',
   '.badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 9px; margin: 3px 6px 0 0; }',
   '.badge.possible { background: #7a5b14; color: #ffe2a0; } .badge.same { background: #1f5d3a; color: #b8f2cf; } .badge.different { background: #3a3d46; color: #b8bcc6; }',
   '.count { margin-left: 6px; color: #8d93a1; }',
@@ -1746,7 +1785,7 @@ function start(core, io) {
   }
 
   /** a song's picture, or a box that says it is gone: a deleted video loses its picture too */
-  function picture(song, title) {
+  function picture(song, title, onShown) {
     var url = core.pictureFor(song);
     var gone = function() { return el('div', { class: 'pic gone', text: 'picture gone', title: title }); };
     if (!url) { return gone(); }
@@ -1755,7 +1794,10 @@ function start(core, io) {
     var swap = function() { if (image.parentNode) { image.parentNode.replaceChild(gone(), image); } };
     image.onerror = swap;
     // for a video that is gone YouTube sends a small grey box (120 wide) instead of the picture, which is not a picture
-    image.onload = function() { if (/\/(hq|mq|sd|maxres)default\.jpg$/.test(url) && image.naturalWidth > 0 && image.naturalWidth <= 120) { swap(); } };
+    image.onload = function() {
+      if (/\/(hq|mq|sd|maxres)default\.jpg$/.test(url) && image.naturalWidth > 0 && image.naturalWidth <= 120) { return swap(); }
+      if (onShown) { onShown(); }
+    };
     return image;
   }
 
@@ -1788,7 +1830,22 @@ function start(core, io) {
       what.appendChild(el('div', { class: 'dead', text: name }));
       what.appendChild(el('div', { class: 'why', text: item.text }));
 
-      var pictures = [picture(item.song, 'the dead song')];
+      // for a song with no replacement, links to look for it elsewhere: by name, and by picture once the picture has loaded
+      var elsewhere = null;
+      var onPicture = null;
+      if (!item.replacement) {
+        var looks = core.lookElsewhere(item.song);
+        elsewhere = el('div', { class: 'why elsewhere' }, [document.createTextNode('Look elsewhere: ')]);
+        var addLink = function(label, url) {
+          elsewhere.appendChild(el('a', { text: label, href: url, target: '_blank', rel: 'noopener noreferrer' }));
+          elsewhere.hidden = false;
+        };
+        elsewhere.hidden = true;
+        looks.names.forEach(function(link) { addLink(link.label, link.url); });
+        if (looks.imageSearch) { onPicture = function() { if (!elsewhere.imageDone) { elsewhere.imageDone = true; addLink('Search by picture', looks.imageSearch); } }; }
+      }
+
+      var pictures = [picture(item.song, 'the dead song', onPicture)];
 
       if (item.replacement) {
         var replacement = item.replacement;
@@ -1816,6 +1873,7 @@ function start(core, io) {
         pictures.push(picture(replacement, 'the replacement'));
       } else {
         what.appendChild(el('div', { class: 'none', text: 'no replacement (' + item.none + ')' }));
+        what.appendChild(elsewhere);
 
         // what the search found and why each result was not taken, so a "no" is never a mystery
         if (item.searched) {

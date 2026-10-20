@@ -32,7 +32,9 @@ describe('the userscript file', function() {
   it('only talks to QueUp, YouTube and SoundCloud, and has nothing that runs code it did not ship with', function() {
     const hosts = new Set();
     (code.match(/https?:\/\/[A-Za-z0-9.-]+/g) || []).forEach(function(url) { hosts.add(url.replace(/^https?:\/\//, '')); });
-    const allowed = ['api.queup.net', 'queup.net', 'www.youtube.com', 'i.ytimg.com', 'soundcloud.com', 'api.soundcloud.com', 'w.soundcloud.com', 'github.com'];
+    // links the person can click (a search for a song they chose), which the script never opens itself
+    const linked = ['lens.google.com', 'www.google.com'];
+    const allowed = linked.concat(['api.queup.net', 'queup.net', 'www.youtube.com', 'i.ytimg.com', 'soundcloud.com', 'api.soundcloud.com', 'w.soundcloud.com', 'github.com']);
     hosts.forEach(function(host) { assert.ok(allowed.indexOf(host) !== -1, 'unexpected host: ' + host); });
 
     ['eval(', 'new Function', 'document.write', 'innerHTML', 'outerHTML', 'insertAdjacentHTML', 'XMLHttpRequest', 'importScripts', '<script', 'localStorage', 'sessionStorage', 'document.cookie', 'WebSocket', 'sendBeacon']
@@ -941,6 +943,31 @@ describe('the userscript, run as a browser would run it', function() {
     assert.equal(details[0].find(function(n) { return n.tagName === 'b'; }).length, 0, 'a name is shown as text, never made into an element');
 
     assert.match(details[1].textContent, /Searched for "Artist 2 - Title 2", and it found nothing\./);
+
+    // links to look elsewhere: by name only with an artist and a title, by picture only once the picture has loaded
+    const elsewhere = shadow.find(function(n) { return n.className === 'why elsewhere'; });
+    assert.equal(elsewhere.length, 2);
+    const linksOf = function(box) { return box.find(function(n) { return n.tagName === 'a'; }); };
+
+    assert.equal(elsewhere[0].hidden, true, '"Lapis" has no artist, and its picture has not loaded');
+    assert.equal(linksOf(elsewhere[0]).length, 0);
+    assert.deepEqual(linksOf(elsewhere[1]).map(function(a) { return a.textContent; }), ['Search the web', 'YouTube', 'SoundCloud']);
+    assert.equal(linksOf(elsewhere[1])[1].href, 'https://www.youtube.com/results?search_query=Artist%202%20Title%202');
+    assert.equal(elsewhere[1].hidden, false);
+
+    const pictureOf = function(n) { return shadow.find(function(x) { return x.tagName === 'img' && x.className === 'pic'; })[n]; };
+    const lapisPicture = pictureOf(0);
+    lapisPicture.naturalWidth = 120;
+    lapisPicture.onload();
+    assert.equal(linksOf(elsewhere[0]).length, 0, "YouTube's grey box for a gone video is not a picture");
+
+    lapisPicture.naturalWidth = 480;
+    lapisPicture.onload();
+    lapisPicture.onload();
+    assert.deepEqual(linksOf(elsewhere[0]).map(function(a) { return a.textContent; }), ['Search by picture'], 'once, and only after it loaded');
+    assert.equal(elsewhere[0].hidden, false);
+    assert.match(linksOf(elsewhere[0])[0].href, /^https:\/\/lens\.google\.com\/uploadbyurl\?url=https%3A%2F%2Fi\.ytimg\.com%2Fvi%2F/);
+    assert.equal(linksOf(elsewhere[0])[0].rel, 'noopener noreferrer');
   });
 
   it('says "1 song" and not "1 songs" in what it reports', async function() {
