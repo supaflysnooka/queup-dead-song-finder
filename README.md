@@ -5,11 +5,13 @@ A userscript for [QueUp](https://queup.net) that checks your own playlists for s
 **Install:** add a userscript manager ([Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)), then open the script file and choose Install:
 [`queup-dead-song-finder.user.js`](https://raw.githubusercontent.com/supaflysnooka/queup-dead-song-finder/main/userscript/queup-dead-song-finder.user.js)
 
+**Or as a browser extension** (Chrome, Edge, Firefox; nothing else to install): see the [extension README](extension/README.md). It isn't in the browser stores yet, so for now it is loaded from this repo.
+
 Everything about how it works, what it checks, and what it asks permission for is in the **[userscript README](userscript/README.md)**.
 
 ## Development
 
-The userscript is one built file, put together from the pieces in `userscript/src` and `lib` by `npm run build`. The tests fail if the built file is out of date.
+The userscript is one built file, put together from the pieces in `userscript/src` and `lib` by `npm run build`, which also builds the extension (`extension/build`). The tests fail if either is out of date. `npm run package` also writes the zips the browser stores take.
 
 ```
 npm run build

@@ -9,6 +9,8 @@
  */
 
 var API = 'https://api.queup.net/';
+// the part of a YouTube watch page that says whether the video can be played
+var PLAYABILITY_MARKER = '"playabilityStatus":\\{"status":"[A-Z_]+"';
 var VERSION = '0.1.18';
 
 var CSS = [
@@ -138,13 +140,15 @@ function makeIo(core) {
           resolve(value);
         }
         // the answer is about 60% of the way into a page of over a megabyte, so reading stops as soon as it is there
-        var marker = /"playabilityStatus":\{"status":"[A-Z_]+"/;
+        var marker = new RegExp(PLAYABILITY_MARKER);
         request = GM_xmlhttpRequest({
           method: 'GET',
           url: url,
           anonymous: true,
           timeout: 15000,
           headers: { 'Accept-Language': 'en-US,en;q=0.9' },
+          // only the browser extension looks at this one: it sends the page along once this has been read, not as it arrives
+          progressWhen: PLAYABILITY_MARKER,
           onprogress: function(response) {
             var text = response && response.responseText;
             if (finished || response.status !== 200 || typeof text !== 'string' || !marker.test(text)) { return; }
