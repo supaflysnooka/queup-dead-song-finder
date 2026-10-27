@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "QueUp Dead Song Finder",
-  "version": "0.1.18",
+  "version": "0.2.0",
   "description": "Finds songs in your own QueUp playlists that can't be played anymore, and finds clear replacements. Nothing changes until you click Apply.",
   "homepage_url": "https://github.com/supaflysnooka/queup-dead-song-finder",
   "icons": {

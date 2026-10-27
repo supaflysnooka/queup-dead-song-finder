@@ -700,6 +700,186 @@ async function apply(io, playlist, items, options) {
   return { results: results, totalItems: totalItems };
 }
 
+// ---- songs that are in more than one place ----
+
+// a playlist read for duplicates is read to its end, up to this many pages (QueUp playlists are 300 songs, 15 pages)
+var DUPLICATE_MAX_PAGES = 100;
+
+/** can this song be told apart from others: it needs a site and an id */
+function hasIdentity(song) {
+  return !!song.type && !!song.fkid;
+}
+
+/**
+ * Are these two different uploads probably the same recording? The title words have to be the same, the name has
+ * to have an artist in it (or enough words) so a bare "Dreams" is not taken for every song called that, they can't be
+ * different versions of the song, and when both lengths are known they have to be about the same.
+ */
+function looksLikeSameUpload(a, b) {
+  var key = songMatch.titleKey(a.name);
+  if (!key || key !== songMatch.titleKey(b.name)) { return false; }
+  if (!songMatch.splitArtistTitle(a.name) && key.split(' ').length < 3) { return false; }
+  if (songMatch.looksLikeAlbumOrMix(a.name) || songMatch.looksLikeAlbumOrMix(b.name)) { return false; }
+  if (songMatch.isDifferentVersion(a.name, b.name) || songMatch.isDifferentVersion(b.name, a.name)) { return false; }
+  return songMatch.isSameLength(a.length, b.length) !== false;
+}
+
+/**
+ * Finds the songs that are in a playlist more than once, or in more than one playlist. This only looks at what was read, nothing is asked of any site.
+ *   exact: the very same video or track. The extra copies in one playlist are suggested for removal, a copy in another playlist is
+ *          not (playlists often overlap on purpose), but can be ticked.
+ *   similar: different uploads that look like the same song (same title words, about the same length). Nothing is suggested, they are looked at first.
+ * @param {{playlist: {id: string, name: string}, songs: object[]}[]} read
+ * @returns {{exact: object[], similar: object[], songs: number}} a group is {name, copies: [{playlist, song, suggested}]}
+ */
+function groupDuplicates(read) {
+  var byKey = {};
+  var order = [];
+  var total = 0;
+
+  read.forEach(function(entry) {
+    entry.songs.forEach(function(song) {
+      total++;
+      if (!hasIdentity(song)) { return; }
+      var key = keyOf(song);
+      if (!byKey[key]) { byKey[key] = []; order.push(key); }
+      byKey[key].push({ playlist: { id: entry.playlist.id, name: entry.playlist.name }, song: song });
+    });
+  });
+
+  var exact = [];
+  order.forEach(function(key) {
+    var copies = byKey[key];
+    if (copies.length < 2) { return; }
+
+    // the first copy in each playlist is kept, the second and later in the same playlist are the ones to take out
+    var seen = {};
+    copies.forEach(function(copy) {
+      copy.suggested = !!seen[copy.playlist.id];
+      seen[copy.playlist.id] = true;
+    });
+    var named = copies.filter(function(copy) { return hasRealName(copy.song); })[0];
+    exact.push({ name: named ? named.song.name : copies[0].song.fkid, copies: copies });
+  });
+
+  // different uploads: one stand-in per distinct video, grouped by the words of the title
+  var buckets = {};
+  var bucketOrder = [];
+  order.forEach(function(key) {
+    var stand = byKey[key][0];
+    if (!hasRealName(stand.song)) { return; }
+    var bucket = songMatch.titleKey(stand.song.name);
+    if (!bucket) { return; }
+    if (!buckets[bucket]) { buckets[bucket] = []; bucketOrder.push(bucket); }
+    buckets[bucket].push(stand);
+  });
+
+  var similar = [];
+  bucketOrder.forEach(function(bucket) {
+    var left = buckets[bucket];
+    // the first song of what is left is the anchor, the ones that look like it join it, the others make the next group
+    while (left.length > 1) {
+      var anchor = left[0];
+      var group = [anchor];
+      var rest = [];
+      left.slice(1).forEach(function(other) { (looksLikeSameUpload(anchor.song, other.song) ? group : rest).push(other); });
+      if (group.length > 1) {
+        similar.push({ name: anchor.song.name, copies: group.map(function(copy) { return { playlist: copy.playlist, song: copy.song, suggested: false }; }) });
+      }
+      left = rest;
+    }
+  });
+
+  return { exact: exact, similar: similar, songs: total };
+}
+
+/**
+ * Reads every one of the playlists to its end, for finding duplicates
+ * @param {{id: string, name: string, totalItems: number|null}[]} playlists
+ * @param {{onProgress: function, shouldStop: function}} options onProgress({index, total, playlist, done})
+ * @returns {Promise<{read: object[], failed: string[], stopped: boolean}>}
+ */
+async function readAllPlaylists(io, playlists, options) {
+  options = options || {};
+  var read = [];
+  var failed = [];
+  var stopped = false;
+
+  for (var i = 0; i < playlists.length; i++) {
+    if (options.shouldStop && options.shouldStop()) { stopped = true; break; }
+    var playlist = playlists[i];
+    if (playlist.totalItems === 0) { continue; }
+
+    var result = await readPlaylist(io, playlist.id, {
+      maxPages: DUPLICATE_MAX_PAGES,
+      shouldStop: options.shouldStop,
+      onProgress: function(info) { if (options.onProgress) { options.onProgress({ index: i, total: playlists.length, playlist: playlist, done: info.done }); } }
+    });
+
+    if (result.error) { failed.push(playlist.name); }
+    else if (!result.finished) { stopped = true; break; }
+    else { read.push({ playlist: playlist, songs: result.songs }); }
+    await io.sleep(io.config.apiMs);
+  }
+
+  return { read: read, failed: failed, stopped: stopped };
+}
+
+/**
+ * Of the copies that were picked, the ones that can safely be removed: at least one copy of every song is always kept,
+ * even when every box is ticked. A copy is only counted once.
+ * @param {object[]} groups from groupDuplicates (exact or similar)
+ * @param {function} isPicked (copy) -> boolean
+ * @returns {{playlist: object, song: object}[]}
+ */
+function safeRemovals(groups, isPicked) {
+  var removals = [];
+  var taken = {};
+
+  groups.forEach(function(group) {
+    var picked = group.copies.filter(isPicked);
+    if (picked.length >= group.copies.length) { picked = picked.slice(1); }
+    picked.forEach(function(copy) {
+      var id = copy.playlist.id + '/' + copy.song.entryId;
+      if (taken[id]) { return; }
+      taken[id] = true;
+      removals.push({ playlist: copy.playlist, song: copy.song });
+    });
+  });
+
+  return removals;
+}
+
+/**
+ * Takes the picked copies out of their playlists. Nothing is added.
+ * @param {{playlist: object, song: object}[]} removals
+ * @param {{onProgress: function, shouldStop: function}} options
+ * @returns {Promise<{results: {playlist: object, song: object, status: string, detail: string}[], totals: object}>} status is 'removed' or 'failed'
+ */
+async function removeCopies(io, removals, options) {
+  options = options || {};
+  var results = [];
+  var totals = {};
+
+  for (var i = 0; i < removals.length; i++) {
+    if (options.shouldStop && options.shouldStop()) { break; }
+    var one = removals[i];
+    if (options.onProgress) { options.onProgress({ stage: 'removing', done: i, total: removals.length }); }
+
+    var answer = await io.api('DELETE', 'playlist/' + one.playlist.id + '/songs/' + one.song.entryId);
+    if (answer.code === 200) {
+      var parsed = queupParse.parseRemoved(answer.body);
+      if (parsed) { totals[one.playlist.id] = parsed.totalItems; }
+      results.push({ playlist: one.playlist, song: one.song, status: 'removed', detail: 'took the extra copy out' });
+    } else {
+      results.push({ playlist: one.playlist, song: one.song, status: 'failed', detail: "couldn't take it out (QueUp answered " + answer.code + answerText(answer) + ')' });
+    }
+    await io.sleep(io.config.apiMs);
+  }
+
+  return { results: results, totals: totals };
+}
+
 // ---- carrying on a scan that was interrupted ----
 
 var CHECKPOINT_MAX_AGE_DAYS = 7;
@@ -977,6 +1157,11 @@ module.exports = {
   findReplacement: findReplacement,
   scan: scan,
   apply: apply,
+  groupDuplicates: groupDuplicates,
+  readAllPlaylists: readAllPlaylists,
+  safeRemovals: safeRemovals,
+  removeCopies: removeCopies,
+  looksLikeSameUpload: looksLikeSameUpload,
   reportText: reportText,
   timeAgo: timeAgo,
   saveReport: saveReport,

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QueUp Dead Song Finder
 // @namespace    https://github.com/supaflysnooka/queup-dead-song-finder
-// @version      0.1.18
+// @version      0.2.0
 // @description  Finds songs in your own QueUp playlists that can't be played anymore, and finds clear replacements. Nothing changes until you click Apply.
 // @author       supaflysnooka
 // @homepageURL  https://github.com/supaflysnooka/queup-dead-song-finder
@@ -1153,6 +1153,186 @@ async function apply(io, playlist, items, options) {
   return { results: results, totalItems: totalItems };
 }
 
+// ---- songs that are in more than one place ----
+
+// a playlist read for duplicates is read to its end, up to this many pages (QueUp playlists are 300 songs, 15 pages)
+var DUPLICATE_MAX_PAGES = 100;
+
+/** can this song be told apart from others: it needs a site and an id */
+function hasIdentity(song) {
+  return !!song.type && !!song.fkid;
+}
+
+/**
+ * Are these two different uploads probably the same recording? The title words have to be the same, the name has
+ * to have an artist in it (or enough words) so a bare "Dreams" is not taken for every song called that, they can't be
+ * different versions of the song, and when both lengths are known they have to be about the same.
+ */
+function looksLikeSameUpload(a, b) {
+  var key = songMatch.titleKey(a.name);
+  if (!key || key !== songMatch.titleKey(b.name)) { return false; }
+  if (!songMatch.splitArtistTitle(a.name) && key.split(' ').length < 3) { return false; }
+  if (songMatch.looksLikeAlbumOrMix(a.name) || songMatch.looksLikeAlbumOrMix(b.name)) { return false; }
+  if (songMatch.isDifferentVersion(a.name, b.name) || songMatch.isDifferentVersion(b.name, a.name)) { return false; }
+  return songMatch.isSameLength(a.length, b.length) !== false;
+}
+
+/**
+ * Finds the songs that are in a playlist more than once, or in more than one playlist. This only looks at what was read, nothing is asked of any site.
+ *   exact: the very same video or track. The extra copies in one playlist are suggested for removal, a copy in another playlist is
+ *          not (playlists often overlap on purpose), but can be ticked.
+ *   similar: different uploads that look like the same song (same title words, about the same length). Nothing is suggested, they are looked at first.
+ * @param {{playlist: {id: string, name: string}, songs: object[]}[]} read
+ * @returns {{exact: object[], similar: object[], songs: number}} a group is {name, copies: [{playlist, song, suggested}]}
+ */
+function groupDuplicates(read) {
+  var byKey = {};
+  var order = [];
+  var total = 0;
+
+  read.forEach(function(entry) {
+    entry.songs.forEach(function(song) {
+      total++;
+      if (!hasIdentity(song)) { return; }
+      var key = keyOf(song);
+      if (!byKey[key]) { byKey[key] = []; order.push(key); }
+      byKey[key].push({ playlist: { id: entry.playlist.id, name: entry.playlist.name }, song: song });
+    });
+  });
+
+  var exact = [];
+  order.forEach(function(key) {
+    var copies = byKey[key];
+    if (copies.length < 2) { return; }
+
+    // the first copy in each playlist is kept, the second and later in the same playlist are the ones to take out
+    var seen = {};
+    copies.forEach(function(copy) {
+      copy.suggested = !!seen[copy.playlist.id];
+      seen[copy.playlist.id] = true;
+    });
+    var named = copies.filter(function(copy) { return hasRealName(copy.song); })[0];
+    exact.push({ name: named ? named.song.name : copies[0].song.fkid, copies: copies });
+  });
+
+  // different uploads: one stand-in per distinct video, grouped by the words of the title
+  var buckets = {};
+  var bucketOrder = [];
+  order.forEach(function(key) {
+    var stand = byKey[key][0];
+    if (!hasRealName(stand.song)) { return; }
+    var bucket = songMatch.titleKey(stand.song.name);
+    if (!bucket) { return; }
+    if (!buckets[bucket]) { buckets[bucket] = []; bucketOrder.push(bucket); }
+    buckets[bucket].push(stand);
+  });
+
+  var similar = [];
+  bucketOrder.forEach(function(bucket) {
+    var left = buckets[bucket];
+    // the first song of what is left is the anchor, the ones that look like it join it, the others make the next group
+    while (left.length > 1) {
+      var anchor = left[0];
+      var group = [anchor];
+      var rest = [];
+      left.slice(1).forEach(function(other) { (looksLikeSameUpload(anchor.song, other.song) ? group : rest).push(other); });
+      if (group.length > 1) {
+        similar.push({ name: anchor.song.name, copies: group.map(function(copy) { return { playlist: copy.playlist, song: copy.song, suggested: false }; }) });
+      }
+      left = rest;
+    }
+  });
+
+  return { exact: exact, similar: similar, songs: total };
+}
+
+/**
+ * Reads every one of the playlists to its end, for finding duplicates
+ * @param {{id: string, name: string, totalItems: number|null}[]} playlists
+ * @param {{onProgress: function, shouldStop: function}} options onProgress({index, total, playlist, done})
+ * @returns {Promise<{read: object[], failed: string[], stopped: boolean}>}
+ */
+async function readAllPlaylists(io, playlists, options) {
+  options = options || {};
+  var read = [];
+  var failed = [];
+  var stopped = false;
+
+  for (var i = 0; i < playlists.length; i++) {
+    if (options.shouldStop && options.shouldStop()) { stopped = true; break; }
+    var playlist = playlists[i];
+    if (playlist.totalItems === 0) { continue; }
+
+    var result = await readPlaylist(io, playlist.id, {
+      maxPages: DUPLICATE_MAX_PAGES,
+      shouldStop: options.shouldStop,
+      onProgress: function(info) { if (options.onProgress) { options.onProgress({ index: i, total: playlists.length, playlist: playlist, done: info.done }); } }
+    });
+
+    if (result.error) { failed.push(playlist.name); }
+    else if (!result.finished) { stopped = true; break; }
+    else { read.push({ playlist: playlist, songs: result.songs }); }
+    await io.sleep(io.config.apiMs);
+  }
+
+  return { read: read, failed: failed, stopped: stopped };
+}
+
+/**
+ * Of the copies that were picked, the ones that can safely be removed: at least one copy of every song is always kept,
+ * even when every box is ticked. A copy is only counted once.
+ * @param {object[]} groups from groupDuplicates (exact or similar)
+ * @param {function} isPicked (copy) -> boolean
+ * @returns {{playlist: object, song: object}[]}
+ */
+function safeRemovals(groups, isPicked) {
+  var removals = [];
+  var taken = {};
+
+  groups.forEach(function(group) {
+    var picked = group.copies.filter(isPicked);
+    if (picked.length >= group.copies.length) { picked = picked.slice(1); }
+    picked.forEach(function(copy) {
+      var id = copy.playlist.id + '/' + copy.song.entryId;
+      if (taken[id]) { return; }
+      taken[id] = true;
+      removals.push({ playlist: copy.playlist, song: copy.song });
+    });
+  });
+
+  return removals;
+}
+
+/**
+ * Takes the picked copies out of their playlists. Nothing is added.
+ * @param {{playlist: object, song: object}[]} removals
+ * @param {{onProgress: function, shouldStop: function}} options
+ * @returns {Promise<{results: {playlist: object, song: object, status: string, detail: string}[], totals: object}>} status is 'removed' or 'failed'
+ */
+async function removeCopies(io, removals, options) {
+  options = options || {};
+  var results = [];
+  var totals = {};
+
+  for (var i = 0; i < removals.length; i++) {
+    if (options.shouldStop && options.shouldStop()) { break; }
+    var one = removals[i];
+    if (options.onProgress) { options.onProgress({ stage: 'removing', done: i, total: removals.length }); }
+
+    var answer = await io.api('DELETE', 'playlist/' + one.playlist.id + '/songs/' + one.song.entryId);
+    if (answer.code === 200) {
+      var parsed = queupParse.parseRemoved(answer.body);
+      if (parsed) { totals[one.playlist.id] = parsed.totalItems; }
+      results.push({ playlist: one.playlist, song: one.song, status: 'removed', detail: 'took the extra copy out' });
+    } else {
+      results.push({ playlist: one.playlist, song: one.song, status: 'failed', detail: "couldn't take it out (QueUp answered " + answer.code + answerText(answer) + ')' });
+    }
+    await io.sleep(io.config.apiMs);
+  }
+
+  return { results: results, totals: totals };
+}
+
 // ---- carrying on a scan that was interrupted ----
 
 var CHECKPOINT_MAX_AGE_DAYS = 7;
@@ -1430,6 +1610,11 @@ module.exports = {
   findReplacement: findReplacement,
   scan: scan,
   apply: apply,
+  groupDuplicates: groupDuplicates,
+  readAllPlaylists: readAllPlaylists,
+  safeRemovals: safeRemovals,
+  removeCopies: removeCopies,
+  looksLikeSameUpload: looksLikeSameUpload,
   reportText: reportText,
   timeAgo: timeAgo,
   saveReport: saveReport,
@@ -1490,7 +1675,7 @@ var require = __require;
 var API = 'https://api.queup.net/';
 // the part of a YouTube watch page that says whether the video can be played
 var PLAYABILITY_MARKER = '"playabilityStatus":\\{"status":"[A-Z_]+"';
-var VERSION = '0.1.18';
+var VERSION = '0.2.0';
 
 var CSS = [
   ':host { all: initial; }',
@@ -1530,6 +1715,7 @@ var CSS = [
   '.reminder { margin: 8px 0; padding: 8px; border: 1px solid #3a3d46; border-radius: 6px; font-size: 12px; } .reminder .due { color: #ffb347; margin-top: 4px; }',
   '.link { background: none; border: 0; padding: 0; margin: 4px 12px 0 0; color: #8ab4f8; text-decoration: underline; cursor: pointer; font-size: 12px; }',
   '.reminder-note { margin: 8px 0; font-size: 12px; color: #7d8391; }',
+  '.copy { margin: 4px 0; align-items: flex-start; } .copy input { margin-top: 3px; }',
   '.tiny { margin-top: 10px; font-size: 11px; color: #7d8391; }'
 ].join('\n');
 
@@ -1648,7 +1834,7 @@ function start(core, io) {
 
   // found: what a scan found, for one playlist or all of them: {multi, scans: [{playlist, scan}], rows: [{item, playlist}], stopped}
   // stopLevel: 0 running, 1 stop checking (replacements for what was found are still looked for), 2 stop that too
-  var state = { playlists: [], found: null, running: false, stopLevel: 0 };
+  var state = { playlists: [], found: null, dupes: null, running: false, stopLevel: 0 };
 
   var host = el('div', { id: 'queup-dead-song-finder' });
   var root = host.attachShadow({ mode: 'open' });
@@ -1666,6 +1852,7 @@ function start(core, io) {
   var maxPages = el('input', { type: 'number', min: '1', max: '100', value: '50' });
   var scanButton = el('button', { class: 'primary', text: 'Scan' });
   var scanAllButton = el('button', { text: 'Scan all playlists', title: 'Checks every playlist, one after the other, from page 1' });
+  var dupesButton = el('button', { text: 'Find duplicates', title: 'Looks through all your playlists for songs that are in them more than once. Nothing is checked on YouTube or SoundCloud, so it is quick.' });
   var stopButton = el('button', { text: 'Stop' });
   var bar = el('div', {}, [el('div')]);
   bar.className = 'bar';
@@ -1705,6 +1892,10 @@ function start(core, io) {
   reminderNote.appendChild(reminderNoteText);
   reminderNote.appendChild(remindAgainButton);
   reminderNote.hidden = true;
+  var removeDupesButton = el('button', { class: 'danger', text: 'Remove ticked copies' });
+  var dupesCount = el('span', { class: 'count', text: '' });
+  var dupesActions = el('div', {}, [removeDupesButton, dupesCount]);
+  dupesActions.hidden = true;
   var resultsActions = el('div', {}, [removeLabel, el('div', {}, [selectAllButton, selectNoneButton, selectedCount]), applyButton, copyButton]);
 
   panel.appendChild(el('h2', {}, [el('span', { text: 'Dead song finder' }), closeButton]));
@@ -1720,10 +1911,11 @@ function start(core, io) {
     el('div', {}, [el('label', { text: 'Pages to check' }), maxPages])
   ]));
   panel.appendChild(pageLabel);
-  panel.appendChild(el('div', {}, [scanButton, scanAllButton, stopButton]));
+  panel.appendChild(el('div', {}, [scanButton, scanAllButton, dupesButton, stopButton]));
   panel.appendChild(bar);
   panel.appendChild(status);
   panel.appendChild(resultsActions);
+  panel.appendChild(dupesActions);
   panel.appendChild(itemsBox);
   panel.appendChild(el('div', { class: 'tiny', text: 'Dead song finder ' + VERSION + '. It only talks to queup.net (your own playlists), YouTube and SoundCloud (is the song there). Nothing is sent anywhere else.' }));
 
@@ -1742,6 +1934,7 @@ function start(core, io) {
   function refreshButtons() {
     scanButton.disabled = state.running || !selectedPlaylist();
     scanAllButton.disabled = state.running || state.playlists.length === 0;
+    dupesButton.disabled = state.running || state.playlists.length === 0;
     stopButton.disabled = !state.running;
     var ticked = itemsBox.querySelectorAll('input[type=checkbox]:checked').length;
     var hasItems = !!(state.found && state.found.rows.length);
@@ -1751,6 +1944,10 @@ function start(core, io) {
     selectAllButton.disabled = state.running || !hasItems;
     selectNoneButton.disabled = state.running || !hasItems || ticked === 0;
     resultsActions.hidden = !state.found || (!hasItems && !state.found.scans.length);
+    var dupeTicks = state.dupes ? itemsBox.querySelectorAll('input[type=checkbox]:checked').length : 0;
+    dupesActions.hidden = !state.dupes || state.dupes.copies.length === 0;
+    removeDupesButton.disabled = state.running || dupeTicks === 0;
+    dupesCount.textContent = state.dupes ? dupeTicks + ' ticked' : '';
     playlistSelect.disabled = state.running;
     refreshSaved();
   }
@@ -1971,6 +2168,7 @@ function start(core, io) {
     state.running = true;
     state.stopLevel = 0;
     state.found = null;
+    state.dupes = null;
     clearItems();
     refreshButtons();
     refreshResume();
@@ -2029,6 +2227,125 @@ function start(core, io) {
     state.running = false;
     refreshButtons();
     refreshResume();
+  }
+
+  /** a group of copies: one line for each, with a box to take that copy out */
+  function showDuplicates(dupes) {
+    clearItems();
+    dupes.copies = [];
+
+    var addGroup = function(group, badgeText, badgeClass) {
+      var lines = [el('div', {}, [el('span', { class: 'badge ' + badgeClass, text: badgeText })]), el('div', { class: 'dead', text: group.name })];
+      group.copies.forEach(function(copy) {
+        var box = el('input', { type: 'checkbox' });
+        box.checked = copy.suggested;
+        box.dataset.copy = String(dupes.copies.length);
+        dupes.copies.push(copy);
+        box.addEventListener('change', function() {
+          // every copy of a song can't be ticked: the last one stays
+          var boxes = lines.map(function(line) { return line.copyBox; }).filter(Boolean);
+          if (boxes.length && boxes.every(function(one) { return one.checked; })) { box.checked = false; }
+          refreshButtons();
+        });
+
+        var link = core.songLink(copy.song);
+        var length = copy.song.length ? ' (' + core.formatLength(copy.song.length) + ')' : '';
+        var label = el('label', { class: 'check copy' }, [box, el('span', {}, [
+          document.createTextNode('in "' + copy.playlist.name + '"' + (core.PLATFORM_NAMES[String(copy.song.type).toLowerCase()] ? ', ' + core.PLATFORM_NAMES[String(copy.song.type).toLowerCase()] : '') + length + ' ')
+        ])]);
+        if (link) { label.lastChild.appendChild(el('a', { text: 'open', href: link, target: '_blank', rel: 'noopener noreferrer' })); }
+        if (group.kind === 'similar' && copy.song.name !== group.name) { label.lastChild.appendChild(el('div', { class: 'why', text: copy.song.name })); }
+        label.copyBox = box;
+        lines.push(label);
+      });
+      itemsBox.appendChild(el('div', { class: 'item' }, [el('div', { class: 'what' }, lines)]));
+    };
+
+    dupes.exact.forEach(function(group) {
+      var inOne = group.copies.every(function(copy) { return copy.playlist.id === group.copies[0].playlist.id; });
+      addGroup(group, inOne ? 'twice in one playlist' : 'in ' + new Set(group.copies.map(function(copy) { return copy.playlist.id; })).size + ' playlists', 'same');
+    });
+    dupes.similar.forEach(function(group) { addGroup(Object.assign({ kind: 'similar' }, group), 'looks like the same song, different upload: check it', 'possible'); });
+  }
+
+  /** reads every playlist and lists the songs that are in more than one place */
+  async function runDuplicates() {
+    if (state.running || state.playlists.length === 0) { return; }
+
+    state.running = true;
+    state.stopLevel = 0;
+    state.found = null;
+    state.dupes = null;
+    clearItems();
+    refreshButtons();
+
+    try {
+      var got = await core.readAllPlaylists(io, state.playlists, {
+        shouldStop: function() { return state.stopLevel >= 1; },
+        onProgress: function(info) { setStatus('Playlist ' + (info.index + 1) + ' of ' + info.total + ', "' + info.playlist.name + '": read ' + info.done + ' songs', info.index / info.total); }
+      });
+
+      var groups = core.groupDuplicates(got.read);
+      state.dupes = { exact: groups.exact, similar: groups.similar, copies: [] };
+      showDuplicates(state.dupes);
+
+      var text = 'Read ' + songsText(groups.songs) + ' in ' + got.read.length + ' playlists: ' + groups.exact.length + ' song' + (groups.exact.length === 1 ? ' is' : 's are') + ' in more than one place, ' + groups.similar.length + ' look' + (groups.similar.length === 1 ? 's' : '') + ' like another upload of the same song.';
+      if (state.dupes.copies.length === 0) { text = 'Read ' + songsText(groups.songs) + ' in ' + got.read.length + ' playlists: no duplicates.'; }
+      if (got.stopped) { text += ' Stopped before the end, so some playlists were not read.'; }
+      if (got.failed.length) { text += ' Could not read: ' + got.failed.map(function(name) { return '"' + name + '"'; }).join(', ') + '.'; }
+      if (state.dupes.copies.length) { text += ' Ticked copies are extra ones in the same playlist. Copies in other playlists are not ticked, playlists often share songs on purpose. One copy of every song always stays.'; }
+      setStatus(text, 1);
+    } catch (error) {
+      setStatus('Sorry, something went wrong: ' + (error && error.message || error));
+    }
+
+    state.running = false;
+    refreshButtons();
+  }
+
+  async function runRemoveDuplicates() {
+    var dupes = state.dupes;
+    if (!dupes || state.running) { return; }
+
+    var ticked = {};
+    itemsBox.querySelectorAll('input[type=checkbox]:checked').forEach(function(box) { ticked[box.dataset.copy] = true; });
+    var isPicked = function(copy) { return !!ticked[String(dupes.copies.indexOf(copy))]; };
+    var removals = core.safeRemovals(dupes.exact.concat(dupes.similar), isPicked);
+    if (removals.length === 0) { return; }
+
+    var names = {};
+    removals.forEach(function(one) { names[one.playlist.id] = true; });
+    if (!window.confirm('Take ' + removals.length + (removals.length === 1 ? ' extra copy' : ' extra copies') + ' out of ' + Object.keys(names).length + ' playlist' + (Object.keys(names).length === 1 ? '' : 's') + '?\n\nOne copy of every song stays. Nothing is added.')) { return; }
+
+    state.running = true;
+    state.stopLevel = 0;
+    refreshButtons();
+
+    try {
+      var done = await core.removeCopies(io, removals, {
+        shouldStop: function() { return state.stopLevel >= 1; },
+        onProgress: function(info) { setStatus('Removing ' + (info.done + 1) + ' of ' + info.total + '...', info.done / info.total); }
+      });
+
+      var fine = done.results.filter(function(entry) { return entry.status === 'removed'; });
+      var problems = done.results.filter(function(entry) { return entry.status === 'failed'; });
+      var text = 'Done: ' + fine.length + ' of ' + removals.length + ' copies taken out.';
+      var counts = Object.keys(done.totals).map(function(id) {
+        var playlist = state.playlists.filter(function(one) { return one.id === id; })[0];
+        return '"' + (playlist ? playlist.name : id) + '" has ' + done.totals[id] + ' songs now';
+      });
+      if (counts.length) { text += ' ' + counts.join(', ') + '.'; }
+      if (problems.length) { text += ' Problems: ' + problems.map(function(entry) { return (core.hasRealName(entry.song) ? entry.song.name : entry.song.fkid) + ' in "' + entry.playlist.name + '": ' + entry.detail; }).join('; ') + '.'; }
+      text += ' Reload QueUp to see the changes, and click Find duplicates again to look again.';
+      setStatus(text, 1);
+      state.dupes = null;
+      clearItems();
+    } catch (error) {
+      setStatus('Sorry, something went wrong: ' + (error && error.message || error));
+    }
+
+    state.running = false;
+    refreshButtons();
   }
 
   /** "1 song", "5 songs" */
@@ -2190,6 +2507,8 @@ function start(core, io) {
   throwSavedButton.addEventListener('click', function() { core.clearReport(io.store); refreshSaved(); });
   discardButton.addEventListener('click', function() { core.clearCheckpoint(io.store); refreshResume(); });
   scanAllButton.addEventListener('click', function() { return runScans(true); });
+  dupesButton.addEventListener('click', runDuplicates);
+  removeDupesButton.addEventListener('click', runRemoveDuplicates);
   stopButton.addEventListener('click', function() {
     state.stopLevel = Math.min(2, state.stopLevel + 1);
     // the first stop still looks for replacements for what was found, which takes a moment, and a second one skips that
@@ -2204,7 +2523,7 @@ function start(core, io) {
   stopRemindingButton.addEventListener('click', function() { core.setReminderOff(io.store, true); refreshReminder(); });
   remindAgainButton.addEventListener('click', function() { core.setReminderOff(io.store, false); refreshReminder(); });
   copyButton.addEventListener('click', copyReport);
-  playlistSelect.addEventListener('change', function() { state.found = null; clearItems(); fromPage.value = '1'; setStatus('Pick a playlist and click Scan, or Scan all playlists.'); refreshButtons(); });
+  playlistSelect.addEventListener('change', function() { state.found = null; state.dupes = null; clearItems(); fromPage.value = '1'; setStatus('Pick a playlist and click Scan, or Scan all playlists.'); refreshButtons(); });
 
   refreshButtons();
   refreshReminder();

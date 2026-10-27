@@ -1292,3 +1292,72 @@ describe('the saved report of a finished scan', function() {
     assert.equal(core.loadReport(store, NOW + DAY), null, 'nothing left to do');
   });
 });
+
+describe('duplicates', function() {
+  const song = function(entryId, name, fkid, extra) { return Object.assign({ entryId: entryId, name: name, type: 'youtube', fkid: fkid, length: 200000 }, extra); };
+  const list = function(id, songs) { return { playlist: { id: id, name: 'List ' + id }, songs: songs }; };
+
+  it('finds the same video twice in one playlist and suggests only the extra copy', function() {
+    const found = core.groupDuplicates([list('a', [song('e1', 'Artist - Tune', 'v1'), song('e2', 'Other - Song', 'v2'), song('e3', 'Artist - Tune', 'v1')])]);
+    assert.equal(found.songs, 3);
+    assert.equal(found.exact.length, 1);
+    assert.deepEqual(found.exact[0].copies.map(function(c) { return [c.song.entryId, c.suggested]; }), [['e1', false], ['e3', true]]);
+  });
+
+  it('finds a song in two playlists but suggests nothing, playlists overlap on purpose', function() {
+    const found = core.groupDuplicates([list('a', [song('e1', 'Artist - Tune', 'v1')]), list('b', [song('e9', 'Artist - Tune', 'v1')])]);
+    assert.equal(found.exact.length, 1);
+    assert.deepEqual(found.exact[0].copies.map(function(c) { return c.suggested; }), [false, false]);
+  });
+
+  it('does not mix up the same id on two sites, or songs with no id', function() {
+    const found = core.groupDuplicates([list('a', [song('e1', 'A - B', 'x1'), song('e2', 'A - B', 'x1', { type: 'soundcloud' }), song('e3', 'A - B', null), song('e4', null, null, { type: null })])]);
+    assert.equal(found.exact.length, 0);
+  });
+
+  it('finds another upload of the same song, and leaves other versions, other lengths and bare titles alone', function() {
+    const found = core.groupDuplicates([list('a', [
+      song('e1', 'Artist - Tune (Official Video)', 'v1'),
+      song('e2', 'Artist - Tune [Label 001]', 'v2', { length: 205000 }),
+      song('e3', 'Artist - Tune (Remix)', 'v3'),
+      song('e4', 'Artist - Tune', 'v4', { length: 400000 }),
+      song('e5', 'Dreams', 'v5'),
+      song('e6', 'Dreams (Official)', 'v6')
+    ])]);
+    assert.equal(found.exact.length, 0);
+    assert.equal(found.similar.length, 1);
+    assert.deepEqual(found.similar[0].copies.map(function(c) { return c.song.fkid; }), ['v1', 'v2']);
+    assert.ok(found.similar[0].copies.every(function(c) { return c.suggested === false; }));
+  });
+
+  it('never removes every copy, even when all are picked, and counts a copy once', function() {
+    const found = core.groupDuplicates([list('a', [song('e1', 'A - T', 'v1'), song('e2', 'A - T', 'v1')]), list('b', [song('e3', 'A - T', 'v1'), song('e4', 'C - D', 'v7'), song('e5', 'C - D', 'v7')])]);
+    const all = core.safeRemovals(found.exact, function() { return true; });
+    assert.deepEqual(all.map(function(r) { return r.song.entryId; }), ['e2', 'e3', 'e5']);
+    assert.deepEqual(core.safeRemovals(found.exact, function() { return false; }), []);
+    const same = core.safeRemovals(found.exact.concat(found.exact), function() { return true; });
+    assert.equal(same.length, 3);
+  });
+
+  it('reads every playlist to its end, skipping empty ones, and says which could not be read', async function() {
+    songs = [];
+    for (var n = 1; n <= 27; n++) { songs.push(entry(n)); }
+    const got = await core.readAllPlaylists(io, [{ id: 'pl1', name: 'Spooky', totalItems: 27 }, { id: 'pl3', name: 'Empty', totalItems: 0 }]);
+    assert.equal(got.read.length, 1);
+    assert.equal(got.read[0].songs.length, 27);
+    assert.deepEqual(got.failed, []);
+    assert.equal(got.stopped, false);
+    assert.ok(!calls.some(function(c) { return c.indexOf('pl3') !== -1; }));
+    assert.ok(!calls.some(function(c) { return /GET http|PAGE/.test(c); }), 'no other site is asked');
+  });
+
+  it('takes the picked copies out and says what happened to each', async function() {
+    removeCodes = { e2: 500 };
+    const removals = [{ playlist: { id: 'pl1', name: 'Spooky' }, song: { entryId: 'e1', fkid: 'v1' } }, { playlist: { id: 'pl1', name: 'Spooky' }, song: { entryId: 'e2', fkid: 'v2' } }];
+    const done = await core.removeCopies(io, removals);
+    assert.deepEqual(done.results.map(function(r) { return r.status; }), ['removed', 'failed']);
+    assert.equal(done.totals.pl1, 33);
+    assert.deepEqual(calls.filter(function(c) { return c.indexOf('DELETE') === 0; }), ['DELETE playlist/pl1/songs/e1', 'DELETE playlist/pl1/songs/e2']);
+    assert.ok(!calls.some(function(c) { return c.indexOf('POST') === 0; }), 'nothing is added');
+  });
+});

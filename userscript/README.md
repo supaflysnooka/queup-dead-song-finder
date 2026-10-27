@@ -33,6 +33,15 @@ It runs in your own browser, signed in as you, so it can work on your playlists.
 
 A dead song with no replacement has an expandable **What was looked at** under it. It says what was searched for and lists each result with its length and why it wasn't taken: `a whole album or a long mix`, `a different version (remix, live, cover...)`, `the title is missing: ...`, `already in the playlist`, `the length is very different`, `the same title, but nothing shows it is the same song`, and so on. If the search found nothing at all it says that. So a "no replacement" always comes with its reasons, and if a good result was turned down, the reason shows what rule to look at.
 
+### Finding duplicates
+
+**Find duplicates** reads all your playlists (QueUp only, nothing is checked on YouTube or SoundCloud, so it takes about a minute) and lists the songs that are in more than one place:
+
+- **Twice in one playlist, or in several playlists**: the very same video or track. The extra copy in the same playlist is ticked. A copy in another playlist is not, as playlists often share songs on purpose, but you can tick it.
+- **Looks like the same song, different upload**: the same title words, not another version (remix, live, acoustic...), about the same length. Nothing is ticked, look at them first. A title with no artist and under 3 words ("Dreams") is left out, it could be any song.
+
+**Remove ticked copies** asks first and only takes songs out, it never adds any. One copy of every song always stays, even if you tick every box. Reload QueUp afterwards to see the playlists.
+
 ### Stop
 
 The first press of **Stop** stops checking more songs, but still looks for replacements for the dead songs found so far, so a stopped scan is still a useful report. That takes a moment, and the panel says so. Press **Stop** a second time to skip that too: the dead songs found are still listed, marked "not searched for". In **Scan all playlists**, Stop also keeps the playlists already done. (If YouTube or SoundCloud ask the browser to slow down the scan stops by itself and doesn't look for replacements, since checking them would only be told the same.)
