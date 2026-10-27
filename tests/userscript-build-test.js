@@ -155,6 +155,60 @@ describe('the userscript, run as a browser would run it', function() {
     }
   });
 
+  it('saves a backup file before Apply changes anything, offers to undo it, and puts the song back', async function() {
+    const app = await open(true);
+    await app.byText('button', 'Dead songs').click();
+    await waitFor(function() { return app.shadow.find(function(n) { return n.tagName === 'option'; }).length > 0; });
+    app.shadow.find(function(n) { return n.tagName === 'select'; })[0].value = 'pl1';
+    await app.byText('button', 'Scan').click();
+    await app.byText('button', 'Apply selected').click();
+
+    assert.equal(app.browser.window.downloads.length, 1, 'one backup file');
+    const file = JSON.parse(await app.browser.window.downloads[0].text());
+    assert.equal(file.playlists[0].name, 'Spooky');
+    const firstChange = app.queup.log.findIndex(function(c) { return c.method === 'POST' || c.method === 'DELETE'; });
+    assert.ok(firstChange > app.queup.log.findIndex(function(c) { return /songs\?page=1/.test(c.url); }), 'the playlist was read before it was changed');
+
+    const box = app.shadow.find(function(n) { return n.tagName === 'button' && n.textContent === 'Undo the last change'; })[0];
+    assert.ok(box, 'undo is offered');
+    app.queup.log.length = 0;
+    await box.click();
+    const changes = app.queup.log.filter(function(c) { return c.method === 'POST' || c.method === 'DELETE'; });
+    assert.equal(changes[0].method, 'POST');
+    assert.match(changes[0].body, /type=youtube/);
+  });
+
+  it('finds duplicates, ticks only the extra copy in the same playlist, and removes just that after a backup', async function() {
+    const app = await open(true);
+    const original = app.queup.fetchImpl;
+    app.browser.context.fetch = function(url, options) {
+      if (/playlist\/pl1\/songs\?page=1$/.test(String(url))) {
+        const entries = [1, 2, 1].map(function(n, i) { return { _id: 'entry' + (i + 1), songid: 's' + n, _song: { _id: 's' + n, name: 'Artist ' + n + ' - Title ' + n, type: 'youtube', fkid: YT(n) } }; });
+        return Promise.resolve({ status: 200, json: function() { return Promise.resolve({ data: entries }); } });
+      }
+      return original(url, options);
+    };
+    await app.byText('button', 'Dead songs').click();
+    await waitFor(function() { return app.shadow.find(function(n) { return n.tagName === 'option'; }).length > 0; });
+    await app.byText('button', 'Find duplicates').click();
+
+    const status = function() { return app.shadow.find(function(n) { return n.className === 'status'; })[0].textContent; };
+    assert.match(status(), /1 song is in more than one place/);
+    const boxes = app.shadow.find(function(n) { return n.tagName === 'input' && n.type === 'checkbox' && n.dataset.copy !== undefined; });
+    assert.deepEqual(boxes.map(function(b) { return b.checked; }), [false, true]);
+
+    // ticking the other copy too is not allowed: one copy stays
+    boxes[0].checked = true;
+    await boxes[0].listeners.change[0]({});
+    assert.equal(boxes[0].checked, false);
+
+    app.queup.log.length = 0;
+    await app.byText('button', 'Remove ticked copies').click();
+    assert.equal(app.browser.window.downloads.length, 1, 'backed up first');
+    const changes = app.queup.log.filter(function(c) { return c.method === 'POST' || c.method === 'DELETE'; });
+    assert.deepEqual(changes.map(function(c) { return c.method + ' ' + c.url; }), ['DELETE https://api.queup.net/playlist/pl1/songs/entry3']);
+  });
+
   it('shows a song name as text, never as page content, whatever it contains', async function() {
     const app = await open(true);
     const original = app.queup.fetchImpl;

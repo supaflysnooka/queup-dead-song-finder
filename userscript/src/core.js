@@ -880,6 +880,128 @@ async function removeCopies(io, removals, options) {
   return { results: results, totals: totals };
 }
 
+// ---- a backup before changing playlists, and undoing the last change ----
+
+var UNDO_MAX_AGE_DAYS = 7;
+
+/** a file name that is safe on any computer: "queup-backup-2026-10-26.json" */
+function backupFileName(now) {
+  return 'queup-playlists-backup-' + new Date(now).toISOString().slice(0, 10) + '.json';
+}
+
+/**
+ * Reads the whole of each playlist and makes a file of what is in them, to be saved before anything is changed.
+ * It is plain JSON (names, sites, ids, lengths): nothing from the person's account but their playlists' songs.
+ * @param {{id: string, name: string}[]} playlists
+ * @returns {Promise<{text: string, fileName: string, songs: number, failed: string[]}>}
+ */
+async function backupPlaylists(io, playlists, now, options) {
+  options = options || {};
+  var saved = [];
+  var failed = [];
+  var count = 0;
+
+  for (var i = 0; i < playlists.length; i++) {
+    var playlist = playlists[i];
+    if (options.onProgress) { options.onProgress({ index: i, total: playlists.length, playlist: playlist }); }
+    var read = await readPlaylist(io, playlist.id, { maxPages: DUPLICATE_MAX_PAGES });
+    if (read.error || !read.finished) { failed.push(playlist.name); continue; }
+
+    count += read.songs.length;
+    saved.push({
+      id: playlist.id,
+      name: playlist.name,
+      songs: read.songs.map(function(song) { return { name: song.name, type: song.type, fkid: song.fkid, length: song.length || null }; })
+    });
+    await io.sleep(io.config.apiMs);
+  }
+
+  var text = JSON.stringify({ app: 'QueUp Dead Song Finder backup', savedAt: new Date(now).toISOString(), playlists: saved }, null, 1);
+  return { text: text, fileName: backupFileName(now), songs: count, failed: failed };
+}
+
+/**
+ * Keeps what was changed so it can be put back. Only ids, sites and names are kept, in the userscript manager's storage.
+ * @param {{playlist: {id: string, name: string}, restore: object, remove: object|null}[]} entries restore is the song that was taken out,
+ *   remove is the replacement that was put in its place (null when nothing was added)
+ */
+function saveUndo(store, entries, now) {
+  var kept = entries.filter(function(entry) { return entry.restore && hasIdentity(entry.restore); }).map(function(entry) {
+    return {
+      playlist: { id: entry.playlist.id, name: entry.playlist.name },
+      restore: { type: entry.restore.type, fkid: entry.restore.fkid, name: entry.restore.name || null },
+      remove: entry.remove && hasIdentity(entry.remove) ? { type: entry.remove.type, fkid: entry.remove.fkid } : null
+    };
+  });
+  if (kept.length === 0) { return store.set('undo', null); }
+  store.set('undo', { v: 1, savedAt: now, entries: kept });
+}
+
+function clearUndo(store) {
+  store.set('undo', null);
+}
+
+/** the last change, if it is recent and shaped as it was saved (what comes out of storage is never trusted) */
+function loadUndo(store, now) {
+  var saved = store.get('undo', null);
+  if (!saved || saved.v !== 1 || typeof saved.savedAt !== 'number' || !Array.isArray(saved.entries) || saved.entries.length === 0) { return null; }
+  if (now - saved.savedAt > UNDO_MAX_AGE_DAYS * DAY_MS || saved.savedAt > now + 60000) { return null; }
+
+  var idLike = /^[A-Za-z0-9]{1,64}$/;
+  var shaped = saved.entries.every(function(entry) {
+    return entry && entry.playlist && idLike.test(String(entry.playlist.id)) && typeof entry.playlist.name === 'string' &&
+      entry.restore && typeof entry.restore.type === 'string' && typeof entry.restore.fkid === 'string' &&
+      (entry.remove === null || (entry.remove && typeof entry.remove.type === 'string' && typeof entry.remove.fkid === 'string'));
+  });
+  return shaped ? saved : null;
+}
+
+function describeUndo(saved, now) {
+  var playlists = {};
+  saved.entries.forEach(function(entry) { playlists[entry.playlist.id] = true; });
+  var n = saved.entries.length;
+  return 'The last change (' + timeAgo(saved.savedAt, now) + ') took out ' + n + (n === 1 ? ' song' : ' songs') + ' in ' + Object.keys(playlists).length + (Object.keys(playlists).length === 1 ? ' playlist' : ' playlists') + ' and can be undone.';
+}
+
+/**
+ * Puts the last change back: each song that was taken out is added again, and the replacement that took its place is taken out
+ * once that worked. A song goes back at the end of the playlist, QueUp has no way to put it where it was.
+ * A video that is dead is added again too (it is what was there), though QueUp may refuse it.
+ * @returns {Promise<{results: {entry: object, status: string, detail: string}[]}>} status is 'restored' or 'failed'
+ */
+async function undoChange(io, saved, options) {
+  options = options || {};
+  var results = [];
+  var read = {};
+
+  for (var i = 0; i < saved.entries.length; i++) {
+    if (options.shouldStop && options.shouldStop()) { break; }
+    var entry = saved.entries[i];
+    if (options.onProgress) { options.onProgress({ stage: 'undoing', done: i, total: saved.entries.length }); }
+
+    var added = await io.api('POST', 'playlist/' + entry.playlist.id + '/songs', { fkid: entry.restore.fkid, type: entry.restore.type });
+    if (added.code !== 200) {
+      results.push({ entry: entry, status: 'failed', detail: "couldn't add it back (QueUp answered " + added.code + answerText(added) + '), left as it is' });
+      await io.sleep(io.config.apiMs);
+      continue;
+    }
+
+    var detail = 'put it back at the end of the playlist';
+    if (entry.remove) {
+      // the replacement is found in the playlist as it is now: the last one with that id is the one that was added
+      var playlistRead = await readPlaylist(io, entry.playlist.id, { maxPages: DUPLICATE_MAX_PAGES });
+      var wanted = keyOf(entry.remove);
+      var found = playlistRead.songs && playlistRead.songs.filter(function(song) { return hasIdentity(song) && keyOf(song) === wanted; }).pop();
+      var taken = found ? await io.api('DELETE', 'playlist/' + entry.playlist.id + '/songs/' + found.entryId) : null;
+      detail += taken && taken.code === 200 ? ' and took the replacement out' : ", but couldn't take the replacement out, do that yourself";
+    }
+    results.push({ entry: entry, status: 'restored', detail: detail });
+    await io.sleep(io.config.apiMs);
+  }
+
+  return { results: results };
+}
+
 // ---- carrying on a scan that was interrupted ----
 
 var CHECKPOINT_MAX_AGE_DAYS = 7;
@@ -1158,6 +1280,13 @@ module.exports = {
   scan: scan,
   apply: apply,
   groupDuplicates: groupDuplicates,
+  backupPlaylists: backupPlaylists,
+  backupFileName: backupFileName,
+  saveUndo: saveUndo,
+  loadUndo: loadUndo,
+  clearUndo: clearUndo,
+  describeUndo: describeUndo,
+  undoChange: undoChange,
   readAllPlaylists: readAllPlaylists,
   safeRemovals: safeRemovals,
   removeCopies: removeCopies,

@@ -1317,6 +1317,128 @@ async function removeCopies(io, removals, options) {
   return { results: results, totals: totals };
 }
 
+// ---- a backup before changing playlists, and undoing the last change ----
+
+var UNDO_MAX_AGE_DAYS = 7;
+
+/** a file name that is safe on any computer: "queup-backup-2026-10-26.json" */
+function backupFileName(now) {
+  return 'queup-playlists-backup-' + new Date(now).toISOString().slice(0, 10) + '.json';
+}
+
+/**
+ * Reads the whole of each playlist and makes a file of what is in them, to be saved before anything is changed.
+ * It is plain JSON (names, sites, ids, lengths): nothing from the person's account but their playlists' songs.
+ * @param {{id: string, name: string}[]} playlists
+ * @returns {Promise<{text: string, fileName: string, songs: number, failed: string[]}>}
+ */
+async function backupPlaylists(io, playlists, now, options) {
+  options = options || {};
+  var saved = [];
+  var failed = [];
+  var count = 0;
+
+  for (var i = 0; i < playlists.length; i++) {
+    var playlist = playlists[i];
+    if (options.onProgress) { options.onProgress({ index: i, total: playlists.length, playlist: playlist }); }
+    var read = await readPlaylist(io, playlist.id, { maxPages: DUPLICATE_MAX_PAGES });
+    if (read.error || !read.finished) { failed.push(playlist.name); continue; }
+
+    count += read.songs.length;
+    saved.push({
+      id: playlist.id,
+      name: playlist.name,
+      songs: read.songs.map(function(song) { return { name: song.name, type: song.type, fkid: song.fkid, length: song.length || null }; })
+    });
+    await io.sleep(io.config.apiMs);
+  }
+
+  var text = JSON.stringify({ app: 'QueUp Dead Song Finder backup', savedAt: new Date(now).toISOString(), playlists: saved }, null, 1);
+  return { text: text, fileName: backupFileName(now), songs: count, failed: failed };
+}
+
+/**
+ * Keeps what was changed so it can be put back. Only ids, sites and names are kept, in the userscript manager's storage.
+ * @param {{playlist: {id: string, name: string}, restore: object, remove: object|null}[]} entries restore is the song that was taken out,
+ *   remove is the replacement that was put in its place (null when nothing was added)
+ */
+function saveUndo(store, entries, now) {
+  var kept = entries.filter(function(entry) { return entry.restore && hasIdentity(entry.restore); }).map(function(entry) {
+    return {
+      playlist: { id: entry.playlist.id, name: entry.playlist.name },
+      restore: { type: entry.restore.type, fkid: entry.restore.fkid, name: entry.restore.name || null },
+      remove: entry.remove && hasIdentity(entry.remove) ? { type: entry.remove.type, fkid: entry.remove.fkid } : null
+    };
+  });
+  if (kept.length === 0) { return store.set('undo', null); }
+  store.set('undo', { v: 1, savedAt: now, entries: kept });
+}
+
+function clearUndo(store) {
+  store.set('undo', null);
+}
+
+/** the last change, if it is recent and shaped as it was saved (what comes out of storage is never trusted) */
+function loadUndo(store, now) {
+  var saved = store.get('undo', null);
+  if (!saved || saved.v !== 1 || typeof saved.savedAt !== 'number' || !Array.isArray(saved.entries) || saved.entries.length === 0) { return null; }
+  if (now - saved.savedAt > UNDO_MAX_AGE_DAYS * DAY_MS || saved.savedAt > now + 60000) { return null; }
+
+  var idLike = /^[A-Za-z0-9]{1,64}$/;
+  var shaped = saved.entries.every(function(entry) {
+    return entry && entry.playlist && idLike.test(String(entry.playlist.id)) && typeof entry.playlist.name === 'string' &&
+      entry.restore && typeof entry.restore.type === 'string' && typeof entry.restore.fkid === 'string' &&
+      (entry.remove === null || (entry.remove && typeof entry.remove.type === 'string' && typeof entry.remove.fkid === 'string'));
+  });
+  return shaped ? saved : null;
+}
+
+function describeUndo(saved, now) {
+  var playlists = {};
+  saved.entries.forEach(function(entry) { playlists[entry.playlist.id] = true; });
+  var n = saved.entries.length;
+  return 'The last change (' + timeAgo(saved.savedAt, now) + ') took out ' + n + (n === 1 ? ' song' : ' songs') + ' in ' + Object.keys(playlists).length + (Object.keys(playlists).length === 1 ? ' playlist' : ' playlists') + ' and can be undone.';
+}
+
+/**
+ * Puts the last change back: each song that was taken out is added again, and the replacement that took its place is taken out
+ * once that worked. A song goes back at the end of the playlist, QueUp has no way to put it where it was.
+ * A video that is dead is added again too (it is what was there), though QueUp may refuse it.
+ * @returns {Promise<{results: {entry: object, status: string, detail: string}[]}>} status is 'restored' or 'failed'
+ */
+async function undoChange(io, saved, options) {
+  options = options || {};
+  var results = [];
+  var read = {};
+
+  for (var i = 0; i < saved.entries.length; i++) {
+    if (options.shouldStop && options.shouldStop()) { break; }
+    var entry = saved.entries[i];
+    if (options.onProgress) { options.onProgress({ stage: 'undoing', done: i, total: saved.entries.length }); }
+
+    var added = await io.api('POST', 'playlist/' + entry.playlist.id + '/songs', { fkid: entry.restore.fkid, type: entry.restore.type });
+    if (added.code !== 200) {
+      results.push({ entry: entry, status: 'failed', detail: "couldn't add it back (QueUp answered " + added.code + answerText(added) + '), left as it is' });
+      await io.sleep(io.config.apiMs);
+      continue;
+    }
+
+    var detail = 'put it back at the end of the playlist';
+    if (entry.remove) {
+      // the replacement is found in the playlist as it is now: the last one with that id is the one that was added
+      var playlistRead = await readPlaylist(io, entry.playlist.id, { maxPages: DUPLICATE_MAX_PAGES });
+      var wanted = keyOf(entry.remove);
+      var found = playlistRead.songs && playlistRead.songs.filter(function(song) { return hasIdentity(song) && keyOf(song) === wanted; }).pop();
+      var taken = found ? await io.api('DELETE', 'playlist/' + entry.playlist.id + '/songs/' + found.entryId) : null;
+      detail += taken && taken.code === 200 ? ' and took the replacement out' : ", but couldn't take the replacement out, do that yourself";
+    }
+    results.push({ entry: entry, status: 'restored', detail: detail });
+    await io.sleep(io.config.apiMs);
+  }
+
+  return { results: results };
+}
+
 // ---- carrying on a scan that was interrupted ----
 
 var CHECKPOINT_MAX_AGE_DAYS = 7;
@@ -1595,6 +1717,13 @@ module.exports = {
   scan: scan,
   apply: apply,
   groupDuplicates: groupDuplicates,
+  backupPlaylists: backupPlaylists,
+  backupFileName: backupFileName,
+  saveUndo: saveUndo,
+  loadUndo: loadUndo,
+  clearUndo: clearUndo,
+  describeUndo: describeUndo,
+  undoChange: undoChange,
   readAllPlaylists: readAllPlaylists,
   safeRemovals: safeRemovals,
   removeCopies: removeCopies,
@@ -1659,7 +1788,7 @@ var require = __require;
 var API = 'https://api.queup.net/';
 // the part of a YouTube watch page that says whether the video can be played
 var PLAYABILITY_MARKER = '"playabilityStatus":\\{"status":"[A-Z_]+"';
-var VERSION = '0.2.0';
+var VERSION = '0.3.0';
 
 var CSS = [
   ':host { all: initial; }',
@@ -1846,6 +1975,9 @@ function start(core, io) {
   pageOption.checked = io.store.get('watchPageCheck', true) !== false;
   var pageLabel = el('label', { class: 'check', title: 'The slowest part of a scan. Without it, deleted, private and embedding-off videos are still found, only videos YouTube blocks (usually by country) are missed.' }, [pageOption, el('span', { text: 'Also look for blocked videos (downloads about 0.8 MB per YouTube song)' })]);
   pageLabel.hidden = !io.page;
+  var backupOption = el('input', { type: 'checkbox' });
+  backupOption.checked = io.store.get('backupFirst', true) !== false;
+  var backupLabel = el('label', { class: 'check', title: 'Saves a file with every song in the playlists that are about to change, so nothing can be lost for good.' }, [backupOption, el('span', { text: 'Download a backup file before changing playlists' })]);
   var removeOption = el('input', { type: 'checkbox' });
   var removeLabel = el('label', { class: 'check' }, [removeOption, el('span', { text: 'Also remove dead songs that have no replacement' })]);
   var applyButton = el('button', { class: 'danger', text: 'Apply selected' });
@@ -1863,6 +1995,11 @@ function start(core, io) {
   var throwSavedButton = el('button', { text: 'Throw the report away' });
   var savedBox = el('div', { class: 'resume' }, [savedText, el('div', {}, [openSavedButton, throwSavedButton])]);
   savedBox.hidden = true;
+  var undoText = el('div', { text: '' });
+  var undoButton = el('button', { class: 'primary', text: 'Undo the last change' });
+  var forgetUndoButton = el('button', { text: 'Forget it' });
+  var undoBox = el('div', { class: 'resume' }, [undoText, el('div', {}, [undoButton, forgetUndoButton])]);
+  undoBox.hidden = true;
   var reminderLast = el('div', { class: 'why', text: '' });
   var reminderDue = el('div', { class: 'due', text: '' });
   var snoozeButton = el('button', { class: 'link', text: 'Remind me in a week' });
@@ -1886,6 +2023,7 @@ function start(core, io) {
   panel.appendChild(el('p', { text: 'Checks your own playlists for songs that can\'t be played anymore, and finds songs that are clearly the same one. Nothing changes until you click Apply.' }));
   panel.appendChild(resumeBox);
   panel.appendChild(savedBox);
+  panel.appendChild(undoBox);
   panel.appendChild(reminderBox);
   panel.appendChild(reminderNote);
   panel.appendChild(el('label', { text: 'Playlist' }));
@@ -1895,6 +2033,7 @@ function start(core, io) {
     el('div', {}, [el('label', { text: 'Pages to check' }), maxPages])
   ]));
   panel.appendChild(pageLabel);
+  panel.appendChild(backupLabel);
   panel.appendChild(el('div', {}, [scanButton, scanAllButton, dupesButton, stopButton]));
   panel.appendChild(bar);
   panel.appendChild(status);
@@ -1934,6 +2073,7 @@ function start(core, io) {
     dupesCount.textContent = state.dupes ? dupeTicks + ' ticked' : '';
     playlistSelect.disabled = state.running;
     refreshSaved();
+    refreshUndo();
   }
 
   /** offers to carry on a scan that was interrupted (the tab was closed, or it was stopped) */
@@ -1948,6 +2088,13 @@ function start(core, io) {
     var report = core.loadReport(io.store, Date.now());
     savedBox.hidden = !report || state.running || !!state.found;
     if (report) { savedText.textContent = core.describeReport(report, Date.now()); }
+  }
+
+  /** offers to put the last change back, while it is recent */
+  function refreshUndo() {
+    var saved = core.loadUndo(io.store, Date.now());
+    undoBox.hidden = !saved || state.running;
+    if (saved) { undoText.textContent = core.describeUndo(saved, Date.now()); }
   }
 
   /** the dot on the button, and the lines about when playlists were last scanned */
@@ -2234,11 +2381,12 @@ function start(core, io) {
 
         var link = core.songLink(copy.song);
         var length = copy.song.length ? ' (' + core.formatLength(copy.song.length) + ')' : '';
-        var label = el('label', { class: 'check copy' }, [box, el('span', {}, [
+        var where = el('span', {}, [
           document.createTextNode('in "' + copy.playlist.name + '"' + (core.PLATFORM_NAMES[String(copy.song.type).toLowerCase()] ? ', ' + core.PLATFORM_NAMES[String(copy.song.type).toLowerCase()] : '') + length + ' ')
-        ])]);
-        if (link) { label.lastChild.appendChild(el('a', { text: 'open', href: link, target: '_blank', rel: 'noopener noreferrer' })); }
-        if (group.kind === 'similar' && copy.song.name !== group.name) { label.lastChild.appendChild(el('div', { class: 'why', text: copy.song.name })); }
+        ]);
+        var label = el('label', { class: 'check copy' }, [box, where]);
+        if (link) { where.appendChild(el('a', { text: 'open', href: link, target: '_blank', rel: 'noopener noreferrer' })); }
+        if (group.kind === 'similar' && copy.song.name !== group.name) { where.appendChild(el('div', { class: 'why', text: copy.song.name })); }
         label.copyBox = box;
         lines.push(label);
       });
@@ -2306,12 +2454,17 @@ function start(core, io) {
     refreshButtons();
 
     try {
+      var affected = [];
+      removals.forEach(function(one) { affected.push(one.playlist); });
+      if (!await backupFirst(affected)) { state.running = false; setStatus('Nothing was changed.'); refreshButtons(); return; }
+
       var done = await core.removeCopies(io, removals, {
         shouldStop: function() { return state.stopLevel >= 1; },
         onProgress: function(info) { setStatus('Removing ' + (info.done + 1) + ' of ' + info.total + '...', info.done / info.total); }
       });
 
       var fine = done.results.filter(function(entry) { return entry.status === 'removed'; });
+      core.saveUndo(io.store, fine.map(function(entry) { return { playlist: entry.playlist, restore: entry.song, remove: null }; }), Date.now());
       var problems = done.results.filter(function(entry) { return entry.status === 'failed'; });
       var text = 'Done: ' + fine.length + ' of ' + removals.length + ' copies taken out.';
       var counts = Object.keys(done.totals).map(function(id) {
@@ -2364,6 +2517,35 @@ function start(core, io) {
     return text;
   }
 
+  /** hands a text to the browser to save as a file */
+  function download(fileName, text) {
+    var url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    var link = el('a', { href: url, download: fileName });
+    root.appendChild(link);
+    link.click();
+    root.removeChild(link);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+  }
+
+  /**
+   * Saves a backup of these playlists when the box is ticked, before they are changed.
+   * @returns {Promise<boolean>} false when the person decided not to go on without it
+   */
+  async function backupFirst(playlists) {
+    if (!backupOption.checked) { return true; }
+    var seen = {};
+    var unique = playlists.filter(function(playlist) { if (seen[playlist.id]) { return false; } seen[playlist.id] = true; return true; });
+
+    var made = await core.backupPlaylists(io, unique, Date.now(), {
+      onProgress: function(info) { setStatus('Saving a backup: playlist ' + (info.index + 1) + ' of ' + info.total + ', "' + info.playlist.name + '"...', info.index / info.total); }
+    });
+    if (made.songs > 0) { download(made.fileName, made.text); }
+    if (made.failed.length) {
+      return window.confirm("Couldn't read " + made.failed.map(function(name) { return '"' + name + '"'; }).join(', ') + ' for the backup.\n\nChange the playlists anyway?');
+    }
+    return true;
+  }
+
   async function runApply() {
     var found = state.found;
     if (!found || state.running) { return; }
@@ -2393,6 +2575,8 @@ function start(core, io) {
     refreshButtons();
 
     try {
+      if (!await backupFirst(groups.map(function(group) { return group.playlist; }))) { state.running = false; setStatus('Nothing was changed.'); refreshButtons(); return; }
+
       var allResults = [];
       var totals = [];
       var totalFor = {};
@@ -2428,6 +2612,9 @@ function start(core, io) {
       text += ' Reload QueUp to see the new playlist' + (groups.length === 1 ? '' : 's') + '.';
       setStatus(text, 1);
 
+      core.saveUndo(io.store, allResults.filter(function(entry) { return entry.result.status === 'replaced' || entry.result.status === 'removed'; })
+        .map(function(entry) { return { playlist: entry.playlist, restore: entry.result.item.song, remove: entry.result.item.replacement || null }; }), Date.now());
+
       core.dropFromReport(io.store, allResults.filter(function(entry) { return entry.result.status === 'replaced' || entry.result.status === 'removed'; })
         .map(function(entry) { return { playlistId: entry.playlist.id, entryId: entry.result.item.entryId }; }), Date.now());
 
@@ -2444,6 +2631,41 @@ function start(core, io) {
   /** tick or untick every song that can be ticked, so picking just one is a click on Select none and one box */
   function setAll(on) {
     itemsBox.querySelectorAll('input[type=checkbox]').forEach(function(box) { if (!box.disabled) { box.checked = on; } });
+    refreshButtons();
+  }
+
+  async function runUndo() {
+    var saved = core.loadUndo(io.store, Date.now());
+    if (!saved || state.running) { refreshUndo(); return; }
+    if (!window.confirm('Put back ' + saved.entries.length + (saved.entries.length === 1 ? ' song' : ' songs') + '?\n\nEach song goes back at the end of its playlist (QueUp can\'t put it where it was), and a replacement that took its place is taken out.')) { return; }
+
+    state.running = true;
+    state.stopLevel = 0;
+    refreshButtons();
+
+    try {
+      var done = await core.undoChange(io, saved, {
+        shouldStop: function() { return state.stopLevel >= 1; },
+        onProgress: function(info) { setStatus('Putting back ' + (info.done + 1) + ' of ' + info.total + '...', info.done / info.total); }
+      });
+      var failed = done.results.filter(function(entry) { return entry.status === 'failed'; });
+      var good = done.results.length - failed.length;
+      var text = 'Undone: ' + good + ' of ' + saved.entries.length + ' songs put back.';
+      if (failed.length) { text += ' Problems: ' + failed.map(function(entry) { return (entry.entry.restore.name || entry.entry.restore.fkid) + ' in "' + entry.entry.playlist.name + '": ' + entry.detail; }).join('; ') + '.'; }
+      text += ' Reload QueUp to see the playlists.';
+      setStatus(text, 1);
+
+      // what could not be put back is kept, to try again
+      var left = saved.entries.filter(function(entry, index) { return !done.results[index] || done.results[index].status === 'failed'; });
+      if (left.length) { core.saveUndo(io.store, left.map(function(entry) { return { playlist: entry.playlist, restore: entry.restore, remove: entry.remove }; }), saved.savedAt); } else { core.clearUndo(io.store); }
+      state.found = null;
+      state.dupes = null;
+      clearItems();
+    } catch (error) {
+      setStatus('Sorry, something went wrong: ' + (error && error.message || error));
+    }
+
+    state.running = false;
     refreshButtons();
   }
 
@@ -2492,6 +2714,9 @@ function start(core, io) {
   discardButton.addEventListener('click', function() { core.clearCheckpoint(io.store); refreshResume(); });
   scanAllButton.addEventListener('click', function() { return runScans(true); });
   dupesButton.addEventListener('click', runDuplicates);
+  undoButton.addEventListener('click', runUndo);
+  forgetUndoButton.addEventListener('click', function() { core.clearUndo(io.store); refreshUndo(); });
+  backupOption.addEventListener('change', function() { io.store.set('backupFirst', backupOption.checked); });
   removeDupesButton.addEventListener('click', runRemoveDuplicates);
   stopButton.addEventListener('click', function() {
     state.stopLevel = Math.min(2, state.stopLevel + 1);
@@ -2513,6 +2738,7 @@ function start(core, io) {
   refreshReminder();
   refreshResume();
   refreshSaved();
+  refreshUndo();
   document.documentElement.appendChild(host);
   return { host: host, root: root };
 }

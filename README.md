@@ -7,6 +7,8 @@ A userscript for [QueUp](https://queup.net) that checks your own playlists for s
 
 **Or as a browser extension** (Chrome, Edge, Firefox; nothing else to install): see the [extension README](extension/README.md). It isn't in the browser stores yet, so for now it is loaded from this repo.
 
+What changed in each version is in the **[changelog](userscript/CHANGELOG.md)**.
+
 Everything about how it works, what it checks, and what it asks permission for is in the **[userscript README](userscript/README.md)**.
 
 ## Development

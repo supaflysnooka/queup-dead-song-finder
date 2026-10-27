@@ -34,7 +34,10 @@ function fakeBrowser(fetchImpl, confirmAnswer, storage, extra) {
   };
   const window = { confirm: function(question) { window.asked = question; return confirmAnswer; } };
   window.top = window; window.self = window; window.document = document;
-  const context = { window: window, document: document, fetch: fetchImpl, URLSearchParams: URLSearchParams, setTimeout: function(fn) { return setImmediate(fn); }, navigator: {}, console: console, Date: FakeDate };
+  // saving a file: the text of each file the page offered to save is kept in window.downloads
+  window.downloads = [];
+  const fakeUrl = { createObjectURL: function(blob) { window.downloads.push(blob); return 'blob:fake/' + window.downloads.length; }, revokeObjectURL: function() {} };
+  const context = { window: window, document: document, fetch: fetchImpl, URLSearchParams: URLSearchParams, Blob: Blob, URL: fakeUrl, setTimeout: function(fn) { return setImmediate(fn); }, navigator: {}, console: console, Date: FakeDate };
   // the userscript manager's own storage, when the test gives one
   if (storage) {
     context.GM_getValue = function(key, fallback) { return Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : fallback; };

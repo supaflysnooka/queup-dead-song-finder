@@ -11,7 +11,7 @@
 var API = 'https://api.queup.net/';
 // the part of a YouTube watch page that says whether the video can be played
 var PLAYABILITY_MARKER = '"playabilityStatus":\\{"status":"[A-Z_]+"';
-var VERSION = '0.2.0';
+var VERSION = '0.3.0';
 
 var CSS = [
   ':host { all: initial; }',
@@ -198,6 +198,9 @@ function start(core, io) {
   pageOption.checked = io.store.get('watchPageCheck', true) !== false;
   var pageLabel = el('label', { class: 'check', title: 'The slowest part of a scan. Without it, deleted, private and embedding-off videos are still found, only videos YouTube blocks (usually by country) are missed.' }, [pageOption, el('span', { text: 'Also look for blocked videos (downloads about 0.8 MB per YouTube song)' })]);
   pageLabel.hidden = !io.page;
+  var backupOption = el('input', { type: 'checkbox' });
+  backupOption.checked = io.store.get('backupFirst', true) !== false;
+  var backupLabel = el('label', { class: 'check', title: 'Saves a file with every song in the playlists that are about to change, so nothing can be lost for good.' }, [backupOption, el('span', { text: 'Download a backup file before changing playlists' })]);
   var removeOption = el('input', { type: 'checkbox' });
   var removeLabel = el('label', { class: 'check' }, [removeOption, el('span', { text: 'Also remove dead songs that have no replacement' })]);
   var applyButton = el('button', { class: 'danger', text: 'Apply selected' });
@@ -215,6 +218,11 @@ function start(core, io) {
   var throwSavedButton = el('button', { text: 'Throw the report away' });
   var savedBox = el('div', { class: 'resume' }, [savedText, el('div', {}, [openSavedButton, throwSavedButton])]);
   savedBox.hidden = true;
+  var undoText = el('div', { text: '' });
+  var undoButton = el('button', { class: 'primary', text: 'Undo the last change' });
+  var forgetUndoButton = el('button', { text: 'Forget it' });
+  var undoBox = el('div', { class: 'resume' }, [undoText, el('div', {}, [undoButton, forgetUndoButton])]);
+  undoBox.hidden = true;
   var reminderLast = el('div', { class: 'why', text: '' });
   var reminderDue = el('div', { class: 'due', text: '' });
   var snoozeButton = el('button', { class: 'link', text: 'Remind me in a week' });
@@ -238,6 +246,7 @@ function start(core, io) {
   panel.appendChild(el('p', { text: 'Checks your own playlists for songs that can\'t be played anymore, and finds songs that are clearly the same one. Nothing changes until you click Apply.' }));
   panel.appendChild(resumeBox);
   panel.appendChild(savedBox);
+  panel.appendChild(undoBox);
   panel.appendChild(reminderBox);
   panel.appendChild(reminderNote);
   panel.appendChild(el('label', { text: 'Playlist' }));
@@ -247,6 +256,7 @@ function start(core, io) {
     el('div', {}, [el('label', { text: 'Pages to check' }), maxPages])
   ]));
   panel.appendChild(pageLabel);
+  panel.appendChild(backupLabel);
   panel.appendChild(el('div', {}, [scanButton, scanAllButton, dupesButton, stopButton]));
   panel.appendChild(bar);
   panel.appendChild(status);
@@ -286,6 +296,7 @@ function start(core, io) {
     dupesCount.textContent = state.dupes ? dupeTicks + ' ticked' : '';
     playlistSelect.disabled = state.running;
     refreshSaved();
+    refreshUndo();
   }
 
   /** offers to carry on a scan that was interrupted (the tab was closed, or it was stopped) */
@@ -300,6 +311,13 @@ function start(core, io) {
     var report = core.loadReport(io.store, Date.now());
     savedBox.hidden = !report || state.running || !!state.found;
     if (report) { savedText.textContent = core.describeReport(report, Date.now()); }
+  }
+
+  /** offers to put the last change back, while it is recent */
+  function refreshUndo() {
+    var saved = core.loadUndo(io.store, Date.now());
+    undoBox.hidden = !saved || state.running;
+    if (saved) { undoText.textContent = core.describeUndo(saved, Date.now()); }
   }
 
   /** the dot on the button, and the lines about when playlists were last scanned */
@@ -586,11 +604,12 @@ function start(core, io) {
 
         var link = core.songLink(copy.song);
         var length = copy.song.length ? ' (' + core.formatLength(copy.song.length) + ')' : '';
-        var label = el('label', { class: 'check copy' }, [box, el('span', {}, [
+        var where = el('span', {}, [
           document.createTextNode('in "' + copy.playlist.name + '"' + (core.PLATFORM_NAMES[String(copy.song.type).toLowerCase()] ? ', ' + core.PLATFORM_NAMES[String(copy.song.type).toLowerCase()] : '') + length + ' ')
-        ])]);
-        if (link) { label.lastChild.appendChild(el('a', { text: 'open', href: link, target: '_blank', rel: 'noopener noreferrer' })); }
-        if (group.kind === 'similar' && copy.song.name !== group.name) { label.lastChild.appendChild(el('div', { class: 'why', text: copy.song.name })); }
+        ]);
+        var label = el('label', { class: 'check copy' }, [box, where]);
+        if (link) { where.appendChild(el('a', { text: 'open', href: link, target: '_blank', rel: 'noopener noreferrer' })); }
+        if (group.kind === 'similar' && copy.song.name !== group.name) { where.appendChild(el('div', { class: 'why', text: copy.song.name })); }
         label.copyBox = box;
         lines.push(label);
       });
@@ -658,12 +677,17 @@ function start(core, io) {
     refreshButtons();
 
     try {
+      var affected = [];
+      removals.forEach(function(one) { affected.push(one.playlist); });
+      if (!await backupFirst(affected)) { state.running = false; setStatus('Nothing was changed.'); refreshButtons(); return; }
+
       var done = await core.removeCopies(io, removals, {
         shouldStop: function() { return state.stopLevel >= 1; },
         onProgress: function(info) { setStatus('Removing ' + (info.done + 1) + ' of ' + info.total + '...', info.done / info.total); }
       });
 
       var fine = done.results.filter(function(entry) { return entry.status === 'removed'; });
+      core.saveUndo(io.store, fine.map(function(entry) { return { playlist: entry.playlist, restore: entry.song, remove: null }; }), Date.now());
       var problems = done.results.filter(function(entry) { return entry.status === 'failed'; });
       var text = 'Done: ' + fine.length + ' of ' + removals.length + ' copies taken out.';
       var counts = Object.keys(done.totals).map(function(id) {
@@ -716,6 +740,35 @@ function start(core, io) {
     return text;
   }
 
+  /** hands a text to the browser to save as a file */
+  function download(fileName, text) {
+    var url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    var link = el('a', { href: url, download: fileName });
+    root.appendChild(link);
+    link.click();
+    root.removeChild(link);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+  }
+
+  /**
+   * Saves a backup of these playlists when the box is ticked, before they are changed.
+   * @returns {Promise<boolean>} false when the person decided not to go on without it
+   */
+  async function backupFirst(playlists) {
+    if (!backupOption.checked) { return true; }
+    var seen = {};
+    var unique = playlists.filter(function(playlist) { if (seen[playlist.id]) { return false; } seen[playlist.id] = true; return true; });
+
+    var made = await core.backupPlaylists(io, unique, Date.now(), {
+      onProgress: function(info) { setStatus('Saving a backup: playlist ' + (info.index + 1) + ' of ' + info.total + ', "' + info.playlist.name + '"...', info.index / info.total); }
+    });
+    if (made.songs > 0) { download(made.fileName, made.text); }
+    if (made.failed.length) {
+      return window.confirm("Couldn't read " + made.failed.map(function(name) { return '"' + name + '"'; }).join(', ') + ' for the backup.\n\nChange the playlists anyway?');
+    }
+    return true;
+  }
+
   async function runApply() {
     var found = state.found;
     if (!found || state.running) { return; }
@@ -745,6 +798,8 @@ function start(core, io) {
     refreshButtons();
 
     try {
+      if (!await backupFirst(groups.map(function(group) { return group.playlist; }))) { state.running = false; setStatus('Nothing was changed.'); refreshButtons(); return; }
+
       var allResults = [];
       var totals = [];
       var totalFor = {};
@@ -780,6 +835,9 @@ function start(core, io) {
       text += ' Reload QueUp to see the new playlist' + (groups.length === 1 ? '' : 's') + '.';
       setStatus(text, 1);
 
+      core.saveUndo(io.store, allResults.filter(function(entry) { return entry.result.status === 'replaced' || entry.result.status === 'removed'; })
+        .map(function(entry) { return { playlist: entry.playlist, restore: entry.result.item.song, remove: entry.result.item.replacement || null }; }), Date.now());
+
       core.dropFromReport(io.store, allResults.filter(function(entry) { return entry.result.status === 'replaced' || entry.result.status === 'removed'; })
         .map(function(entry) { return { playlistId: entry.playlist.id, entryId: entry.result.item.entryId }; }), Date.now());
 
@@ -796,6 +854,41 @@ function start(core, io) {
   /** tick or untick every song that can be ticked, so picking just one is a click on Select none and one box */
   function setAll(on) {
     itemsBox.querySelectorAll('input[type=checkbox]').forEach(function(box) { if (!box.disabled) { box.checked = on; } });
+    refreshButtons();
+  }
+
+  async function runUndo() {
+    var saved = core.loadUndo(io.store, Date.now());
+    if (!saved || state.running) { refreshUndo(); return; }
+    if (!window.confirm('Put back ' + saved.entries.length + (saved.entries.length === 1 ? ' song' : ' songs') + '?\n\nEach song goes back at the end of its playlist (QueUp can\'t put it where it was), and a replacement that took its place is taken out.')) { return; }
+
+    state.running = true;
+    state.stopLevel = 0;
+    refreshButtons();
+
+    try {
+      var done = await core.undoChange(io, saved, {
+        shouldStop: function() { return state.stopLevel >= 1; },
+        onProgress: function(info) { setStatus('Putting back ' + (info.done + 1) + ' of ' + info.total + '...', info.done / info.total); }
+      });
+      var failed = done.results.filter(function(entry) { return entry.status === 'failed'; });
+      var good = done.results.length - failed.length;
+      var text = 'Undone: ' + good + ' of ' + saved.entries.length + ' songs put back.';
+      if (failed.length) { text += ' Problems: ' + failed.map(function(entry) { return (entry.entry.restore.name || entry.entry.restore.fkid) + ' in "' + entry.entry.playlist.name + '": ' + entry.detail; }).join('; ') + '.'; }
+      text += ' Reload QueUp to see the playlists.';
+      setStatus(text, 1);
+
+      // what could not be put back is kept, to try again
+      var left = saved.entries.filter(function(entry, index) { return !done.results[index] || done.results[index].status === 'failed'; });
+      if (left.length) { core.saveUndo(io.store, left.map(function(entry) { return { playlist: entry.playlist, restore: entry.restore, remove: entry.remove }; }), saved.savedAt); } else { core.clearUndo(io.store); }
+      state.found = null;
+      state.dupes = null;
+      clearItems();
+    } catch (error) {
+      setStatus('Sorry, something went wrong: ' + (error && error.message || error));
+    }
+
+    state.running = false;
     refreshButtons();
   }
 
@@ -844,6 +937,9 @@ function start(core, io) {
   discardButton.addEventListener('click', function() { core.clearCheckpoint(io.store); refreshResume(); });
   scanAllButton.addEventListener('click', function() { return runScans(true); });
   dupesButton.addEventListener('click', runDuplicates);
+  undoButton.addEventListener('click', runUndo);
+  forgetUndoButton.addEventListener('click', function() { core.clearUndo(io.store); refreshUndo(); });
+  backupOption.addEventListener('change', function() { io.store.set('backupFirst', backupOption.checked); });
   removeDupesButton.addEventListener('click', runRemoveDuplicates);
   stopButton.addEventListener('click', function() {
     state.stopLevel = Math.min(2, state.stopLevel + 1);
@@ -865,6 +961,7 @@ function start(core, io) {
   refreshReminder();
   refreshResume();
   refreshSaved();
+  refreshUndo();
   document.documentElement.appendChild(host);
   return { host: host, root: root };
 }

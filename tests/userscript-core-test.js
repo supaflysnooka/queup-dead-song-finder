@@ -1361,3 +1361,59 @@ describe('duplicates', function() {
     assert.ok(!calls.some(function(c) { return c.indexOf('POST') === 0; }), 'nothing is added');
   });
 });
+
+describe('backup and undo', function() {
+  const NOW = Date.UTC(2026, 9, 26, 12);
+  const memory = function() { const d = {}; return { get: function(k, f) { return k in d ? d[k] : f; }, set: function(k, v) { d[k] = v; } }; };
+  const gone = { playlist: { id: 'pl1', name: 'Spooky' }, restore: { type: 'youtube', fkid: YT(1), name: 'Artist 1 - Title 1' }, remove: { type: 'youtube', fkid: 'new00000001' } };
+
+  it('makes a backup file of whole playlists, with nothing but the songs', async function() {
+    const made = await core.backupPlaylists(io, [{ id: 'pl1', name: 'Spooky' }], NOW);
+    const file = JSON.parse(made.text);
+    assert.equal(made.fileName, 'queup-playlists-backup-2026-10-26.json');
+    assert.equal(made.songs, 27);
+    assert.deepEqual(Object.keys(file.playlists[0].songs[0]).sort(), ['fkid', 'length', 'name', 'type']);
+    assert.equal(file.playlists[0].name, 'Spooky');
+    assert.deepEqual(made.failed, []);
+  });
+
+  it('names a playlist it could not read', async function() {
+    io.api = async function() { return { code: 500, body: null }; };
+    const made = await core.backupPlaylists(io, [{ id: 'pl1', name: 'Spooky' }], NOW);
+    assert.deepEqual(made.failed, ['Spooky']);
+    assert.equal(made.songs, 0);
+  });
+
+  it('keeps the last change, forgets it after a week, and never trusts storage', function() {
+    const store = memory();
+    core.saveUndo(store, [gone], NOW);
+    assert.equal(core.loadUndo(store, NOW + 1000).entries.length, 1);
+    assert.match(core.describeUndo(core.loadUndo(store, NOW + 1000), NOW + 1000), /took out 1 song in 1 playlist/);
+    assert.equal(core.loadUndo(store, NOW + 8 * 86400000), null);
+    [null, 'x', { v: 2 }, { v: 1, savedAt: NOW, entries: [{ playlist: { id: 'a b', name: 'x' }, restore: { type: 't', fkid: 'f' }, remove: null }] }].forEach(function(bad) {
+      store.set('undo', bad);
+      assert.equal(core.loadUndo(store, NOW), null);
+    });
+    core.saveUndo(store, [], NOW);
+    assert.equal(core.loadUndo(store, NOW), null);
+  });
+
+  it('puts a removed song back, and takes the replacement out once that worked', async function() {
+    songs = [entry(5), entry(6)];
+    songs[1]._song.fkid = 'new00000001';
+    const done = await core.undoChange(io, { entries: [gone] });
+    assert.deepEqual(done.results.map(function(r) { return r.status; }), ['restored']);
+    const posts = calls.filter(function(c) { return c.indexOf('POST') === 0; });
+    assert.equal(posts.length, 1);
+    assert.match(posts[0], new RegExp(YT(1)));
+    assert.deepEqual(calls.filter(function(c) { return c.indexOf('DELETE') === 0; }), ['DELETE playlist/pl1/songs/entry6']);
+    assert.ok(calls.indexOf(posts[0]) < calls.findIndex(function(c) { return c.indexOf('DELETE') === 0; }), 'added back first');
+  });
+
+  it('leaves the replacement alone when the song could not be added back', async function() {
+    addCode = 400;
+    const done = await core.undoChange(io, { entries: [gone] });
+    assert.equal(done.results[0].status, 'failed');
+    assert.ok(!calls.some(function(c) { return c.indexOf('DELETE') === 0; }));
+  });
+});

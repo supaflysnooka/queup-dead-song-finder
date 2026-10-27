@@ -42,6 +42,10 @@ A dead song with no replacement has an expandable **What was looked at** under i
 
 **Remove ticked copies** asks first and only takes songs out, it never adds any. One copy of every song always stays, even if you tick every box. Reload QueUp afterwards to see the playlists.
 
+### Backup and undo
+
+Before **Apply selected** or **Remove ticked copies** changes anything, a backup file (`queup-playlists-backup-<date>.json`) with every song in the playlists about to change is downloaded. It is on by default, there is a box to turn it off. After a change, **Undo the last change** at the top of the panel puts the removed songs back, at the end of their playlist (QueUp can't put a song where it was), and takes out the replacement that took its place. It is offered for a week, and a song that could not be put back is kept to try again. A video that is dead is added back too, it is what was there, though QueUp may refuse it.
+
 ### Stop
 
 The first press of **Stop** stops checking more songs, but still looks for replacements for the dead songs found so far, so a stopped scan is still a useful report. That takes a moment, and the panel says so. Press **Stop** a second time to skip that too: the dead songs found are still listed, marked "not searched for". In **Scan all playlists**, Stop also keeps the playlists already done. (If YouTube or SoundCloud ask the browser to slow down the scan stops by itself and doesn't look for replacements, since checking them would only be told the same.)
