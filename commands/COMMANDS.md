@@ -192,7 +192,7 @@ that end with a point keyword, so they can be changed with `!overtrigger`.
 * **!lastplayed** or **!lastsong** or **!lasttrack** - Name and link of the song that just played
 * **!lasttrigger** - The most recently created or changed trigger and who did it
 * **!mostused** - The 10 triggers that get used the most (or `!mostused 20`, up to 25). Uses are counted from when this was added, and asking again within a minute won't repost it
-* **!searchauthor [username]** - The triggers a person made. Long lists show a page at a time, say `more` for the next one. If nobody has that name it suggests similar ones
+* **!searchauthor [username]** (also **!mytriggers**) - The triggers a person made. With no name, or `me`, it shows the ones you made. Long lists show a page at a time, say `more` for the next one. If nobody has that name it suggests similar ones
 * **!link** - Get the current song's name and link.
     * *Note*: Get's the actual link of the song to SoundCloud instead of the api.soundcloud..../redirect link
 * **!translate [text]** - Link to a Google Translate page for the text
