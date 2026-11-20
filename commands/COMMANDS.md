@@ -189,6 +189,7 @@ that end with a point keyword, so they can be changed with `!overtrigger`.
 * **!rediscover** - A random song from the room's history that hasn't been played for a long time (a year, or 90 days if nothing is that old yet), with who played it last. For a DJ who can't think of what to queue
 * **!topdjs** - Who has played the most songs in the room, this month and all time. Counted from November 2026, the bot itself is left out
 * **!mystats** - Everything the bot counts about you in one line: props, flow, songs played, and your brb, glhf, dog walk and coffee counts (what is zero is left out). `!mystats @name` for someone else
+* **!whopropped** (also **!propsfrom**) - The 5 people who have given you the most props, like `*Props for you* from: 1) bob (3) | 2) ...`. `!whopropped @name` for someone else. Counted from when this was added (the bot only kept totals before), and flow points aren't counted
 * **!lastplayed** or **!lastsong** or **!lasttrack** - Name and link of the song that just played
 * **!lasttrigger** - The most recently created or changed trigger and who did it
 * **!mostused** - The 10 triggers that get used the most (or `!mostused 20`, up to 25). Uses are counted from when this was added, and asking again within a minute won't repost it
